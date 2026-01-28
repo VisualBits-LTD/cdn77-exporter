@@ -60,6 +60,8 @@ class Event:
     response_status: int
     client_country: str
     location_id: str
+    client_ip: str
+    device_type: str
     raw_data: Dict[str, Any]  # Full JSON for future extensibility
     
     @property
@@ -75,6 +77,7 @@ class AggregationType(Enum):
     MAX = "max"
     MIN = "min"
     COUNT = "count"
+    UNIQUE_COUNT = "unique_count"  # Count of unique values
 
 
 @dataclass
@@ -178,6 +181,55 @@ class EventBuffer:
 
 
 # ============================================================================
+# DEVICE DETECTION
+# ============================================================================
+
+def detect_device_type(user_agent: str) -> str:
+    """
+    Detect device type from User-Agent string
+    
+    Returns:
+        - baron_mobile: Baron iOS/Android app
+        - apple_tv: Apple TV / tvOS
+        - roku: Roku devices
+        - firestick: Amazon Fire TV
+        - android_tv: Android TV devices
+        - web: Desktop/mobile browsers
+        - other: Unknown devices
+    """
+    if not user_agent:
+        return "other"
+    
+    ua_lower = user_agent.lower()
+    
+    # Baron mobile app detection (customize based on your app's UA string)
+    if "baron" in ua_lower or "virtualrailfan" in ua_lower:
+        if "ios" in ua_lower or "iphone" in ua_lower or "ipad" in ua_lower:
+            return "baron_mobile"
+        if "android" in ua_lower and "mobile" in ua_lower:
+            return "baron_mobile"
+    
+    # OTT Platform detection
+    if "appletv" in ua_lower or "apple tv" in ua_lower or "tvos" in ua_lower:
+        return "apple_tv"
+    
+    if "roku" in ua_lower:
+        return "roku"
+    
+    if "aft" in ua_lower or "amazon" in ua_lower and "fire" in ua_lower:
+        return "firestick"
+    
+    if "android" in ua_lower and "tv" in ua_lower:
+        return "android_tv"
+    
+    # Web browsers
+    if any(browser in ua_lower for browser in ["chrome", "firefox", "safari", "edge", "opera"]):
+        return "web"
+    
+    return "other"
+
+
+# ============================================================================
 # METRIC REGISTRY
 # ============================================================================
 
@@ -199,6 +251,12 @@ def extract_location_id(event: Event) -> str:
 
 def extract_response_status(event: Event) -> str:
     return str(event.response_status)
+
+def extract_client_ip(event: Event) -> str:
+    return event.client_ip
+
+def extract_device_type(event: Event) -> str:
+    return event.device_type
 
 
 # Metric definitions
@@ -251,6 +309,25 @@ METRIC_DEFINITIONS = [
             "pop": extract_location_id,
         },
         help_text="Request count by HTTP response status code"
+    ),
+    MetricDefinition(
+        name="cdn77_users_total",
+        value_extractor=lambda e: e.client_ip,  # Value is the IP address itself
+        aggregation=AggregationType.UNIQUE_COUNT,
+        labels={
+            "stream_name": extract_stream_id,
+        },
+        help_text="Count of unique IP addresses per stream"
+    ),
+    MetricDefinition(
+        name="cdn77_users_by_device_total",
+        value_extractor=lambda e: e.client_ip,  # Value is the IP address itself
+        aggregation=AggregationType.UNIQUE_COUNT,
+        labels={
+            "stream_name": extract_stream_id,
+            "device_type": extract_device_type,
+        },
+        help_text="Count of unique IP addresses per stream by device type"
     ),
 ]
 
@@ -409,6 +486,7 @@ class LogParser:
                 self.success_count += 1
             
             # Create Event object
+            user_agent = data.get('clientRequestUserAgent', '')
             event = Event(
                 timestamp=dt,
                 stream_id=stream_id,
@@ -421,6 +499,8 @@ class LogParser:
                 response_status=data.get('responseStatus', 0),
                 client_country=data.get('clientCountry', 'XX'),
                 location_id=data.get('locationID', 'unknown'),
+                client_ip=data.get('clientIP', '0.0.0.0'),
+                device_type=detect_device_type(user_agent),
                 raw_data=data
             )
             
@@ -514,13 +594,13 @@ class MetricAggregator:
     def __init__(self, metric_definitions: List[MetricDefinition]):
         self.metric_definitions = metric_definitions
     
-    def aggregate_events(self, events: List[Event]) -> Dict[str, Dict[Tuple[str, ...], List[float]]]:
+    def aggregate_events(self, events: List[Event]) -> Dict[str, Dict[Tuple[str, ...], any]]:
         """
         Aggregate events into metrics
         
-        Returns: {metric_name: {label_tuple: [values]}}
+        Returns: {metric_name: {label_tuple: [values] or {unique_values}}}
         """
-        # Structure: {metric_name: {(label1_val, label2_val, ...): [values]}}
+        # Structure: {metric_name: {(label1_val, label2_val, ...): [values] or set(values)}}
         aggregated = {}
         
         for metric_def in self.metric_definitions:
@@ -541,10 +621,18 @@ class MetricAggregator:
                 # Create label tuple for grouping (sorted for consistency)
                 label_tuple = tuple(labels[k] for k in sorted(labels.keys()))
                 
-                # Add value to aggregation
+                # Initialize collection based on aggregation type
                 if label_tuple not in aggregated[metric_def.name]:
-                    aggregated[metric_def.name][label_tuple] = []
-                aggregated[metric_def.name][label_tuple].append(value)
+                    if metric_def.aggregation == AggregationType.UNIQUE_COUNT:
+                        aggregated[metric_def.name][label_tuple] = set()
+                    else:
+                        aggregated[metric_def.name][label_tuple] = []
+                
+                # Add value to aggregation
+                if metric_def.aggregation == AggregationType.UNIQUE_COUNT:
+                    aggregated[metric_def.name][label_tuple].add(value)
+                else:
+                    aggregated[metric_def.name][label_tuple].append(value)
         
         return aggregated
     
@@ -573,6 +661,9 @@ class MetricAggregator:
                 elif metric_def.aggregation == AggregationType.MIN:
                     final_value = min(values)
                 elif metric_def.aggregation == AggregationType.COUNT:
+                    final_value = len(values)
+                elif metric_def.aggregation == AggregationType.UNIQUE_COUNT:
+                    # values is a set for UNIQUE_COUNT
                     final_value = len(values)
                 else:
                     logger.warning(f"Unknown aggregation type: {metric_def.aggregation}")

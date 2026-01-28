@@ -13,7 +13,7 @@ Daemon service that polls CDN77 S3-compatible storage for real-time access logs 
 
 ## Metrics Exported
 
-The exporter generates 4 metrics with rich dimensional labels (stream_name, cdn_id, cache_status, pop, response_status):
+The exporter generates 6 metrics with rich dimensional labels (stream_name, cdn_id, cache_status, pop, response_status, device_type):
 
 ### Counters (use with `rate()` or `increase()`)
 
@@ -36,6 +36,21 @@ The exporter generates 4 metrics with rich dimensional labels (stream_name, cdn_
 - Labels: `stream_name`, `cdn_id`, `cache_status`, `pop`, `response_status`
 - Query 4xx error rate: `sum(rate(cdn77_responses_total{stream_name="...", response_status=~"4.."}[5m]))`
 - Query success rate: `sum(rate(cdn77_responses_total{stream_name="...", response_status="200"}[5m]))`
+
+**`cdn77_users_total`**
+- Count of unique IP addresses per stream (counter)
+- Labels: `stream_name`
+- Query unique users per stream: `cdn77_users_total{stream_name="..."}`
+- Query total unique users across all streams: `sum(cdn77_users_total)`
+- Query unique users rate: `rate(cdn77_users_total{stream_name="..."}[5m])`
+
+**`cdn77_users_by_device_total`**
+- Count of unique IP addresses per stream by device type (counter)
+- Labels: `stream_name`, `device_type`
+- Device types: `baron_mobile`, `apple_tv`, `roku`, `firestick`, `android_tv`, `web`, `other`
+- Query Baron mobile vs OTT: `cdn77_users_by_device_total{stream_name="...", device_type=~"baron_mobile|apple_tv|roku|firestick"}`
+- Query by platform: `sum by (device_type) (cdn77_users_by_device_total{stream_name="..."})`
+- Compare platforms: `cdn77_users_by_device_total{stream_name="...", device_type="roku"}` vs `device_type="apple_tv"`
 
 ### Gauges (use with `avg_over_time()`)
 
@@ -107,6 +122,8 @@ The exporter processes real-time CDN77 access logs in NDJSON format (newline-del
 - `timestamp` - ISO 8601 timestamp, parsed and rounded down to the minute for aggregation
 - `clientRequestPath` - Request path, stream ID extracted via regex `/([a-f0-9]{32})/`
 - `responseBytes` - Bytes transferred, aggregated by stream + minute
+- `clientIP` - Client IP address, used for unique user counting per stream
+- `clientRequestUserAgent` - User-Agent string, parsed to detect device type (Baron mobile app, Apple TV, Roku, Firestick, etc.)
 
 **Available But Unused Fields:**
 - **Timing Metrics**: `startTimeMs`, `tcpRTTus`, `requestTimeMs`, `timeToFirstByteMs`
