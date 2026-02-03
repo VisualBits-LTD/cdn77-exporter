@@ -304,23 +304,3 @@ Aggregate by Minute+Labels → Apply Offset → Push to Prometheus → Delete fr
 ```bash
 docker logs -f cdn77-s3-importer
 ```
-
-**View metrics being processed:**
-```bash
-docker logs cdn77-s3-importer | grep "PARSE SUCCESS"
-docker logs cdn77-s3-importer | grep "Time range"
-```
-
-**Check for duplicate timestamp errors:**
-```bash
-docker logs cdn77-s3-importer | grep "duplicate sample"
-```
-
-**Restart container:**
-```bash
-docker restart cdn77-s3-importer
-```
-
-## Legacy API-Based Exporter
-
-The original `exporter.py` script that uses the CDN77 API to fetch daily log files is still available but deprecated. Use `s3_importer.py` for real-time log processing.
