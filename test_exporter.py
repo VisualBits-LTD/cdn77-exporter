@@ -517,6 +517,110 @@ class TestDeviceDetection:
         
         assert roku_metric['value'] == 2  # 2 unique IPs on Roku
         assert apple_tv_metric['value'] == 2  # 2 unique IPs on Apple TV
+    
+    def test_unique_users_by_country(self):
+        """Test unique IP counting per country"""
+        parser = LogParser()
+        aggregator = MetricAggregator(METRIC_DEFINITIONS)
+        
+        base_time = datetime(2026, 1, 28, 12, 30, 0, tzinfo=timezone.utc)
+        stream_id = "abcd1234567890abcdef1234567890ab"
+        
+        # Create events with client_country field already set
+        events = [
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="losangelesUSCA",
+                raw_data={}
+            ),
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.2",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="losangelesUSCA",
+                raw_data={}
+            ),
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",  # Duplicate IP from US
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="losangelesUSCA",
+                raw_data={}
+            ),
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.3",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="CA",
+                location_id="losangelesUSCA",
+                raw_data={}
+            ),
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.4",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="CA",
+                location_id="losangelesUSCA",
+                raw_data={}
+            ),
+        ]
+        
+        aggregated = aggregator.aggregate_events(events)
+        computed = aggregator.compute_final_values(aggregated)
+        
+        # Find users_by_country metrics
+        country_metrics = [m for m in computed if m['metric_name'] == 'cdn77_users_by_country_total']
+        
+        us_metric = [m for m in country_metrics if m['labels']['country'] == 'US'][0]
+        ca_metric = [m for m in country_metrics if m['labels']['country'] == 'CA'][0]
+        
+        assert us_metric['value'] == 2  # 2 unique IPs from US
+        assert ca_metric['value'] == 2  # 2 unique IPs from CA
 
 
 class TestIntegration:

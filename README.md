@@ -13,7 +13,7 @@ Daemon service that polls CDN77 S3-compatible storage for real-time access logs 
 
 ## Metrics Exported
 
-The exporter generates 10 metrics with rich dimensional labels (stream_name, cdn_id, cache_status, pop, response_status, device_type, country, region):
+The exporter generates 11 metrics with rich dimensional labels (stream_name, cdn_id, cache_status, pop, response_status, device_type, country, region):
 
 ### Counters (use with `rate()` or `increase()`)
 
@@ -51,6 +51,14 @@ The exporter generates 10 metrics with rich dimensional labels (stream_name, cdn
 - Query Baron mobile vs OTT: `cdn77_users_by_device_total{stream_name="...", device_type=~"baron_mobile|apple_tv|roku|firestick"}`
 - Query by platform: `sum by (device_type) (cdn77_users_by_device_total{stream_name="..."})`
 - Compare platforms: `cdn77_users_by_device_total{stream_name="...", device_type="roku"}` vs `device_type="apple_tv"`
+
+**`cdn77_users_by_country_total`**
+- Count of unique IP addresses per stream by country (counter)
+- Labels: `stream_name`, `country`
+- Country from CDN77 logs (ISO 3166-1 alpha-2)
+- Query unique users per country: `cdn77_users_by_country_total{stream_name="...", country="US"}`
+- Query top countries: `topk(10, cdn77_users_by_country_total{stream_name="..."})`
+- Query growth rate: `rate(cdn77_users_by_country_total{stream_name="...", country="US"}[5m])`
 
 ### Gauges (use with `max_over_time()` or direct value)
 

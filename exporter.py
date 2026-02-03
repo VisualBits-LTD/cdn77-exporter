@@ -548,6 +548,16 @@ METRIC_DEFINITIONS = [
         },
         help_text="Count of unique IP addresses per stream by device type"
     ),
+    MetricDefinition(
+        name="cdn77_users_by_country_total",
+        value_extractor=lambda e: e.client_ip,  # Value is the IP address itself
+        aggregation=AggregationType.UNIQUE_COUNT,
+        labels={
+            "stream_name": extract_stream_id,
+            "country": extract_client_country,
+        },
+        help_text="Count of unique IP addresses per stream by country"
+    ),
 ]
 
 
