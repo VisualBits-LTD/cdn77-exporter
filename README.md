@@ -13,7 +13,7 @@ Daemon service that polls CDN77 S3-compatible storage for real-time access logs 
 
 ## Metrics Exported
 
-The exporter generates 6 metrics with rich dimensional labels (stream_name, cdn_id, cache_status, pop, response_status, device_type):
+The exporter generates 10 metrics with rich dimensional labels (stream_name, cdn_id, cache_status, pop, response_status, device_type, country, region):
 
 ### Counters (use with `rate()` or `increase()`)
 
@@ -52,7 +52,35 @@ The exporter generates 6 metrics with rich dimensional labels (stream_name, cdn_
 - Query by platform: `sum by (device_type) (cdn77_users_by_device_total{stream_name="..."})`
 - Compare platforms: `cdn77_users_by_device_total{stream_name="...", device_type="roku"}` vs `device_type="apple_tv"`
 
-### Gauges (use with `avg_over_time()`)
+### Gauges (use with `max_over_time()` or direct value)
+
+**`cdn77_active_viewers`**
+- Current unique viewers in rolling time window (gauge)
+- Labels: `stream_name`, `window`
+- Tracks unique IPs over 2-hour rolling window (handles retroactive data)
+- Query current unique viewers: `cdn77_active_viewers{stream_name="...", window="2h"}`
+- Query peak during broadcast: `max_over_time(cdn77_active_viewers{stream_name="...", window="2h"}[3h])`
+- Query average concurrent: `avg_over_time(cdn77_active_viewers{stream_name="...", window="2h"}[1h])`
+
+**`cdn77_active_viewers_by_device`**
+- Current unique viewers by device type in rolling window (gauge)
+- Labels: `stream_name`, `device_type`, `window`
+- Query by platform: `cdn77_active_viewers_by_device{stream_name="...", device_type="roku", window="2h"}`
+- Baron vs OTT: `sum by (device_type) (cdn77_active_viewers_by_device{stream_name="...", window="2h"})`
+
+**`cdn77_active_viewers_by_country`**
+- Current unique viewers by country in rolling window (gauge)
+- Labels: `stream_name`, `country`, `window`
+- Requires GeoIP database (see setup below)
+- Query top countries: `topk(10, cdn77_active_viewers_by_country{stream_name="...", window="2h"})`
+- Query specific country: `cdn77_active_viewers_by_country{stream_name="...", country="US", window="2h"}`
+
+**`cdn77_active_viewers_by_region`**
+- Current unique viewers by state/region in rolling window (gauge)
+- Labels: `stream_name`, `country`, `region`, `window`
+- Requires GeoIP database (see setup below)
+- Query top regions: `topk(10, cdn77_active_viewers_by_region{stream_name="...", window="2h"})`
+- Query US states: `cdn77_active_viewers_by_region{stream_name="...", country="US", window="2h"}`
 
 **`cdn77_time_to_first_byte_ms`**
 - Average time to first byte in milliseconds (gauge)
@@ -142,6 +170,26 @@ s3://real-time-logs-synwudjt/real-time-logs/all-logs/YYYYMMDD/HH/
 
 Files contain approximately 30 seconds of log data, delivered with minimal latency.
 
+## GeoIP Setup (Optional)
+
+For geographic metrics (`cdn77_active_viewers_by_country` and `cdn77_active_viewers_by_region`), download the MaxMind GeoLite2 database:
+
+1. **Sign up for free MaxMind account:** https://dev.maxmind.com/geoip/geolite2-free-geolocation-data
+2. **Download GeoLite2-City.mmdb** (~70MB)
+3. **Mount database in Docker:**
+   ```yaml
+   volumes:
+     - ./GeoLite2-City.mmdb:/app/GeoLite2-City.mmdb:ro
+   ```
+4. **Add environment variable:**
+   ```yaml
+   GEOIP_DB_PATH: /app/GeoLite2-City.mmdb
+   ```
+
+**Performance:** 1-5 microseconds per lookup, ~50MB memory overhead
+
+**Without GeoIP:** Geographic metrics will show country="XX" and region="Unknown"
+
 ## Usage
 
 ### Docker Compose (Recommended)
@@ -203,6 +251,8 @@ python s3_importer.py
 - `PROMETHEUS_PASSWORD` - Prometheus basic auth password (optional)
 - `POLL_INTERVAL` - Polling interval in seconds (default: 60)
 - `LOOKBACK_HOURS` - How far back to check for files (default: 2)
+- `SESSION_WINDOW_SECONDS` - Rolling window for active viewer tracking (default: 7200 = 2 hours)
+- `GEOIP_DB_PATH` - Path to MaxMind GeoLite2-City.mmdb database (optional, for geographic metrics)
 
 ## How It Works
 

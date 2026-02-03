@@ -22,6 +22,7 @@ import signal
 import sys
 import threading
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -32,6 +33,14 @@ import boto3
 from botocore.exceptions import ClientError
 import requests
 import snappy
+
+try:
+    import geoip2.database
+    from geoip2.errors import AddressNotFoundError
+    GEOIP_AVAILABLE = True
+except ImportError:
+    GEOIP_AVAILABLE = False
+    logger.warning("GeoIP2 not available. Install with: pip install geoip2 maxminddb")
 
 # Configure logging
 logging.basicConfig(
@@ -178,6 +187,216 @@ class EventBuffer:
         """Return number of buffered events"""
         with self._lock:
             return len(self.events)
+
+
+@dataclass
+class SessionInfo:
+    """Information about an IP session"""
+    last_seen: datetime
+    device_type: str
+    country: str
+    region: str  # State/province
+
+
+class SessionTracker:
+    """
+    Tracks unique IP sessions in a rolling time window for accurate concurrent viewer counts.
+    
+    Handles retroactive data by updating timestamps as new events arrive.
+    Generates gauge metrics representing unique viewers in the window.
+    """
+    
+    def __init__(self, window_seconds: int = 7200, geoip_db_path: Optional[str] = None):
+        """
+        Initialize session tracker
+        
+        Args:
+            window_seconds: Rolling window size in seconds (default: 2 hours)
+            geoip_db_path: Path to MaxMind GeoIP2 database file (optional)
+        """
+        self.window = timedelta(seconds=window_seconds)
+        self.window_label = f"{window_seconds//3600}h" if window_seconds >= 3600 else f"{window_seconds//60}m"
+        
+        # Store: {stream_id: {ip_address: SessionInfo}}
+        self.sessions: Dict[str, Dict[str, SessionInfo]] = defaultdict(dict)
+        self._lock = threading.Lock()
+        
+        # GeoIP lookup
+        self.geoip_reader = None
+        if geoip_db_path and GEOIP_AVAILABLE:
+            try:
+                self.geoip_reader = geoip2.database.Reader(geoip_db_path)
+                logger.info(f"GeoIP database loaded: {geoip_db_path}")
+            except Exception as e:
+                logger.warning(f"Failed to load GeoIP database: {e}")
+    
+    def lookup_geo(self, ip_address: str) -> Tuple[str, str]:
+        """
+        Lookup country and region for IP address
+        
+        Returns:
+            Tuple of (country_code, region_name)
+        """
+        if not self.geoip_reader:
+            return ("XX", "Unknown")
+        
+        try:
+            response = self.geoip_reader.city(ip_address)
+            country = response.country.iso_code or "XX"
+            region = response.subdivisions.most_specific.name if response.subdivisions else "Unknown"
+            return (country, region)
+        except (AddressNotFoundError, AttributeError):
+            return ("XX", "Unknown")
+        except Exception as e:
+            logger.debug(f"GeoIP lookup failed for {ip_address}: {e}")
+            return ("XX", "Unknown")
+    
+    def update(self, events: List[Event]):
+        """
+        Update session tracker with new events.
+        Events may be retroactive (from delayed files).
+        """
+        with self._lock:
+            for event in events:
+                # Try to get country from event first, fallback to GeoIP lookup
+                country = event.client_country if hasattr(event, 'client_country') and event.client_country else None
+                region = None
+                
+                # If not in event, try GeoIP lookup
+                if not country:
+                    country, region = self.lookup_geo(event.client_ip)
+                
+                # Update or create session info
+                current_session = self.sessions[event.stream_id].get(event.client_ip)
+                
+                if current_session is None or event.timestamp > current_session.last_seen:
+                    # New session or more recent timestamp
+                    self.sessions[event.stream_id][event.client_ip] = SessionInfo(
+                        last_seen=event.timestamp,
+                        device_type=event.device_type,
+                        country=country,
+                        region=region
+                    )
+    
+    def expire_old(self, reference_time: datetime):
+        """
+        Remove sessions older than the rolling window.
+        
+        Args:
+            reference_time: Current time to calculate cutoff
+        """
+        cutoff = reference_time - self.window
+        
+        with self._lock:
+            for stream_id in list(self.sessions.keys()):
+                expired_ips = [
+                    ip for ip, session in self.sessions[stream_id].items()
+                    if session.last_seen < cutoff
+                ]
+                
+                for ip in expired_ips:
+                    del self.sessions[stream_id][ip]
+                
+                # Remove empty streams
+                if not self.sessions[stream_id]:
+                    del self.sessions[stream_id]
+    
+    def get_gauge_metrics(self, batch_offset_ms: int = 0) -> List[Dict]:
+        """
+        Generate gauge metrics for current session state.
+        
+        Returns metrics representing unique viewers in the rolling window:
+        - cdn77_active_viewers: Total unique IPs per stream
+        - cdn77_active_viewers_by_device: Unique IPs per stream per device
+        - cdn77_active_viewers_by_country: Unique IPs per stream per country
+        - cdn77_active_viewers_by_region: Unique IPs per stream per region
+        
+        Args:
+            batch_offset_ms: Millisecond offset to prevent duplicate timestamps
+        """
+        with self._lock:
+            metrics = []
+            now = datetime.now(timezone.utc)
+            timestamp_ms = int(now.timestamp() * 1000) + batch_offset_ms
+            
+            for stream_id, sessions in self.sessions.items():
+                if not sessions:
+                    continue
+                
+                # Total unique viewers
+                metrics.append({
+                    'metric_name': 'cdn77_active_viewers',
+                    'value': float(len(sessions)),
+                    'timestamp_ms': timestamp_ms,
+                    'labels': {
+                        'stream_name': stream_id,
+                        'window': self.window_label
+                    }
+                })
+                
+                # Group by device type
+                by_device = defaultdict(set)
+                by_country = defaultdict(set)
+                by_region = defaultdict(set)
+                
+                for ip, session in sessions.items():
+                    by_device[session.device_type].add(ip)
+                    by_country[session.country].add(ip)
+                    by_region[f"{session.country}_{session.region}"].add(ip)
+                
+                # Device metrics
+                for device_type, ips in by_device.items():
+                    metrics.append({
+                        'metric_name': 'cdn77_active_viewers_by_device',
+                        'value': float(len(ips)),
+                        'timestamp_ms': timestamp_ms,
+                        'labels': {
+                            'stream_name': stream_id,
+                            'device_type': device_type,
+                            'window': self.window_label
+                        }
+                    })
+                
+                # Country metrics
+                for country, ips in by_country.items():
+                    metrics.append({
+                        'metric_name': 'cdn77_active_viewers_by_country',
+                        'value': float(len(ips)),
+                        'timestamp_ms': timestamp_ms,
+                        'labels': {
+                            'stream_name': stream_id,
+                            'country': country,
+                            'window': self.window_label
+                        }
+                    })
+                
+                # Region metrics (country_region to avoid conflicts)
+                for region_key, ips in by_region.items():
+                    country, region = region_key.split('_', 1)
+                    if region != "Unknown":  # Skip unknown regions
+                        metrics.append({
+                            'metric_name': 'cdn77_active_viewers_by_region',
+                            'value': float(len(ips)),
+                            'timestamp_ms': timestamp_ms,
+                            'labels': {
+                                'stream_name': stream_id,
+                                'country': country,
+                                'region': region,
+                                'window': self.window_label
+                            }
+                        })
+            
+            return metrics
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get statistics about current sessions"""
+        with self._lock:
+            total_streams = len(self.sessions)
+            total_sessions = sum(len(sessions) for sessions in self.sessions.values())
+            return {
+                'streams': total_streams,
+                'total_sessions': total_sessions
+            }
 
 
 # ============================================================================
@@ -737,6 +956,45 @@ class PrometheusExporter:
         
         if skipped_old > 0 or parse_failed > 0:
             logger.warning(f"Skipped {skipped_old} old, {parse_failed} parse failures")
+        
+        return metrics
+    
+    def build_gauge_metrics(self, gauge_data: List[Dict]) -> List[Dict]:
+        """
+        Build Prometheus metrics from gauge data (already has timestamps).
+        
+        Args:
+            gauge_data: List of dicts with metric_name, value, timestamp_ms, labels
+        """
+        metrics = []
+        oldest_allowed = int((datetime.now(timezone.utc).timestamp() - (7 * 24 * 60 * 60)) * 1000)
+        skipped_old = 0
+        
+        for data in gauge_data:
+            metric_name = data['metric_name']
+            labels = data['labels']
+            value = data['value']
+            timestamp_ms = data['timestamp_ms']
+            
+            # Skip samples older than 7 days
+            if timestamp_ms < oldest_allowed:
+                skipped_old += 1
+                continue
+            
+            # Build label string
+            label_strs = []
+            for key, val in sorted(labels.items()):
+                label_strs.append(f'{key}="{val}"')
+            label_string = ','.join(label_strs)
+            
+            metrics.append({
+                'metric': f'{metric_name}{{{label_string}}}',
+                'value': value,
+                'timestamp': timestamp_ms
+            })
+        
+        if skipped_old > 0:
+            logger.warning(f"Skipped {skipped_old} old gauge metrics")
         
         return metrics
     

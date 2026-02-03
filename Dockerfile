@@ -1,4 +1,4 @@
-FROM python:3.11-alpine
+FROM python:3.11-alpine AS base
 
 LABEL maintainer="VisualBits LTD"
 LABEL description="CDN77 to Prometheus metrics exporter daemon"
@@ -19,6 +19,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy exporter scripts and protobuf definitions
 COPY exporter.py remote_pb2.py .
+
+# Test stage - runs test suite
+FROM base AS test
+COPY test_exporter.py .
+RUN python -m pytest test_exporter.py -v
+
+# Production stage
+FROM base AS production
 RUN chmod +x exporter.py
 
 # Create data directory for state persistence

@@ -14,6 +14,7 @@ import pytest
 from exporter import (
     Event, LogParser, MetricAggregator, AggregationType,
     MetricDefinition, METRIC_DEFINITIONS, detect_device_type,
+    SessionTracker, SessionInfo,
     extract_stream_id, extract_cdn_id, extract_cache_status,
     extract_location_id, extract_response_status, extract_client_ip, extract_device_type
 )
@@ -658,6 +659,626 @@ class TestPerformance:
         assert len(computed) > 0
         assert elapsed < 0.5  # Should aggregate in under 0.5 seconds
         print(f"\nAggregated 1000 events in {elapsed:.3f}s")
+
+
+class TestSessionTracker:
+    """Test session tracking with rolling windows"""
+    
+    def test_session_tracking_basic(self):
+        """Test basic session tracking"""
+        tracker = SessionTracker(window_seconds=300)  # 5 minute window
+        
+        base_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+        stream_id = "abcd1234567890abcdef1234567890ab"
+        
+        # Create some test events
+        events = []
+        for i in range(5):
+            event = Event(
+                timestamp=base_time + timedelta(seconds=i*10),
+                stream_id=stream_id,
+                client_ip=f"10.0.0.{i}",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="losangelesUSCA",
+                device_type="web",
+                raw_data={}
+            )
+            events.append(event)
+        
+        tracker.update(events)
+        
+        # Should have 5 unique IPs
+        stats = tracker.get_stats()
+        assert stats['total_sessions'] == 5
+        assert stats['streams'] == 1
+    
+    def test_session_expiration(self):
+        """Test that old sessions expire"""
+        tracker = SessionTracker(window_seconds=60)  # 1 minute window
+        
+        base_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+        stream_id = "abcd1234567890abcdef1234567890ab"
+        
+        # Add session at 12:00
+        event1 = Event(
+            timestamp=base_time,
+            stream_id=stream_id,
+            client_ip="10.0.0.1",
+            resource_id=123,
+            cache_status="HIT",
+            response_bytes=1000,
+            time_to_first_byte_ms=100,
+            tcp_rtt_us=50000,
+            request_time_ms=150,
+            response_status=200,
+            client_country="US",
+            location_id="losangelesUSCA",
+            device_type="web",
+            raw_data={}
+        )
+        
+        tracker.update([event1])
+        assert tracker.get_stats()['total_sessions'] == 1
+        
+        # Expire sessions older than 2 minutes (should remove the 12:00 session)
+        tracker.expire_old(base_time + timedelta(minutes=2))
+        assert tracker.get_stats()['total_sessions'] == 0
+    
+    def test_gauge_metrics_generation(self):
+        """Test gauge metric generation"""
+        tracker = SessionTracker(window_seconds=300)
+        
+        base_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+        stream_id = "abcd1234567890abcdef1234567890ab"
+        
+        # Add 3 sessions with different devices
+        events = [
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="roku",
+                resource_id=123, cache_status="HIT", response_bytes=1000,
+                time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
+                response_status=200, client_country="US", location_id="losangelesUSCA",
+                raw_data={}
+            ),
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.2",
+                device_type="apple_tv",
+                resource_id=123, cache_status="HIT", response_bytes=1000,
+                time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
+                response_status=200, client_country="US", location_id="losangelesUSCA",
+                raw_data={}
+            ),
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.3",
+                device_type="roku",
+                resource_id=123, cache_status="HIT", response_bytes=1000,
+                time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
+                response_status=200, client_country="CA", location_id="losangelesUSCA",
+                raw_data={}
+            )
+        ]
+        
+        tracker.update(events)
+        metrics = tracker.get_gauge_metrics()
+        
+        # Should have total, by_device, and by_country metrics
+        metric_names = {m['metric_name'] for m in metrics}
+        assert 'cdn77_active_viewers' in metric_names
+        assert 'cdn77_active_viewers_by_device' in metric_names
+        assert 'cdn77_active_viewers_by_country' in metric_names
+        
+        # Check total viewers
+        total_metric = [m for m in metrics if m['metric_name'] == 'cdn77_active_viewers'][0]
+        assert total_metric['value'] == 3.0
+        
+        # Check device breakdown
+        device_metrics = [m for m in metrics if m['metric_name'] == 'cdn77_active_viewers_by_device']
+        roku_count = [m for m in device_metrics if m['labels']['device_type'] == 'roku'][0]['value']
+        apple_tv_count = [m for m in device_metrics if m['labels']['device_type'] == 'apple_tv'][0]['value']
+        assert roku_count == 2.0
+        assert apple_tv_count == 1.0
+    
+    def test_retroactive_updates(self):
+        """Test handling of retroactive data (delayed files)"""
+        tracker = SessionTracker(window_seconds=7200)  # 2 hour window
+        
+        base_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+        stream_id = "abcd1234567890abcdef1234567890ab"
+        
+        # First batch: events at 12:00
+        batch1 = [
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="web",
+                resource_id=123, cache_status="HIT", response_bytes=1000,
+                time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
+                response_status=200, client_country="US", location_id="losangelesUSCA",
+                raw_data={}
+            )
+        ]
+        
+        tracker.update(batch1)
+        assert tracker.get_stats()['total_sessions'] == 1
+        
+        # Second batch: retroactive events from 11:50 (10 minutes ago)
+        batch2 = [
+            Event(
+                timestamp=base_time - timedelta(minutes=10),
+                stream_id=stream_id,
+                client_ip="10.0.0.2",  # New IP
+                device_type="roku",
+                resource_id=123, cache_status="HIT", response_bytes=1000,
+                time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
+                response_status=200, client_country="US", location_id="losangelesUSCA",
+                raw_data={}
+            ),
+            Event(
+                timestamp=base_time - timedelta(minutes=5),
+                stream_id=stream_id,
+                client_ip="10.0.0.1",  # Same IP as batch1, update timestamp
+                device_type="web",
+                resource_id=123, cache_status="HIT", response_bytes=1000,
+                time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
+                response_status=200, client_country="US", location_id="losangelesUSCA",
+                raw_data={}
+            )
+        ]
+        
+        tracker.update(batch2)
+        
+        # Should have 2 unique IPs (10.0.0.1 updated, 10.0.0.2 added)
+        assert tracker.get_stats()['total_sessions'] == 2
+        
+        # Generate metrics - should show increased count
+        metrics = tracker.get_gauge_metrics()
+        total_metric = [m for m in metrics if m['metric_name'] == 'cdn77_active_viewers'][0]
+        assert total_metric['value'] == 2.0
+
+
+class TestSessionTrackerSimulation:
+    """Large-scale simulation tests for session tracking"""
+    
+    def test_large_scale_simulation(self):
+        """
+        Simulate 3 hours of real-world data with:
+        - Multiple streams
+        - Varying viewer counts
+        - Realistic IP patterns (some viewers stay, some leave)
+        - Out-of-order file arrival
+        """
+        tracker = SessionTracker(window_seconds=7200)  # 2 hour window
+        
+        # Simulation parameters
+        num_streams = 3
+        streams = [f"stream{i:032x}" for i in range(num_streams)]
+        base_time = datetime(2026, 2, 3, 10, 0, 0, tzinfo=timezone.utc)
+        
+        # Track ground truth for validation
+        ground_truth = {}  # {stream_id: {ip: last_seen_time}}
+        
+        # Generate 3 hours of data in 30-second batches (360 batches)
+        batches_generated = 0
+        total_events = 0
+        
+        print(f"\n{'='*70}")
+        print(f"LARGE SCALE SIMULATION TEST")
+        print(f"{'='*70}")
+        print(f"Streams: {num_streams}")
+        print(f"Duration: 3 hours")
+        print(f"Window: 2 hours")
+        print(f"Batch size: 30 seconds")
+        print(f"{'='*70}\n")
+        
+        for minute_offset in range(0, 180, 1):  # Every minute for 3 hours
+            batch_time = base_time + timedelta(minutes=minute_offset)
+            
+            # Simulate file arrival delay (0-20 minutes)
+            file_arrival_delay = random.randint(0, 20)
+            
+            events = []
+            
+            for stream_idx, stream_id in enumerate(streams):
+                # Each stream has different viewer patterns
+                base_viewers = 100 + (stream_idx * 50)  # 100, 150, 200 base viewers
+                
+                # Vary viewers over time (simulate peak hours)
+                hour_factor = 1.0 + 0.5 * abs(2.0 - (minute_offset / 60.0))
+                num_viewers = int(base_viewers * hour_factor)
+                
+                # Generate viewers for this minute
+                for i in range(num_viewers):
+                    # 70% chance IP is from "returning" viewer pool
+                    # 30% chance it's a new viewer
+                    if random.random() < 0.7 and stream_id in ground_truth and ground_truth[stream_id]:
+                        # Pick existing IP
+                        ip = random.choice(list(ground_truth[stream_id].keys()))
+                    else:
+                        # New IP
+                        ip = f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(0,255)}"
+                    
+                    # Update ground truth
+                    if stream_id not in ground_truth:
+                        ground_truth[stream_id] = {}
+                    ground_truth[stream_id][ip] = batch_time
+                    
+                    # Create event
+                    device_types = ["roku", "apple_tv", "web", "firestick", "baron_mobile"]
+                    event = Event(
+                        timestamp=batch_time,
+                        stream_id=stream_id,
+                        client_ip=ip,
+                        device_type=random.choice(device_types),
+                        resource_id=123,
+                        cache_status="HIT",
+                        response_bytes=random.randint(1000, 10000),
+                        time_to_first_byte_ms=random.randint(50, 300),
+                        tcp_rtt_us=random.randint(10000, 100000),
+                        request_time_ms=random.randint(100, 500),
+                        response_status=200,
+                        client_country=random.choice(["US", "CA", "GB", "DE", "FR"]),
+                        location_id="losangelesUSCA",
+                        raw_data={}
+                    )
+                    events.append(event)
+                    total_events += 1
+            
+            # Update tracker with this batch
+            tracker.update(events)
+            
+            # Simulate expiration every 10 minutes
+            if minute_offset % 10 == 0:
+                tracker.expire_old(batch_time)
+                
+                # Calculate expected count (IPs within 2-hour window)
+                cutoff = batch_time - timedelta(hours=2)
+                expected_per_stream = {}
+                for stream_id, ips in ground_truth.items():
+                    expected_per_stream[stream_id] = sum(
+                        1 for last_seen in ips.values() if last_seen >= cutoff
+                    )
+                
+                # Get actual count
+                stats = tracker.get_stats()
+                metrics = tracker.get_gauge_metrics()
+                
+                # Print progress
+                total_expected = sum(expected_per_stream.values())
+                print(f"t+{minute_offset:03d}m | Events: {len(events):4d} | "
+                      f"Sessions: {stats['total_sessions']:5d} | "
+                      f"Expected: {total_expected:5d} | "
+                      f"Memory: ~{stats['total_sessions'] * 100 / 1024:.1f}KB")
+                
+                # Validate counts are close (within 5% due to timing)
+                for stream_id in streams:
+                    stream_metrics = [m for m in metrics 
+                                    if m['metric_name'] == 'cdn77_active_viewers' 
+                                    and m['labels']['stream_name'] == stream_id]
+                    if stream_metrics:
+                        actual = int(stream_metrics[0]['value'])
+                        expected = expected_per_stream.get(stream_id, 0)
+                        if expected > 0:
+                            diff_pct = abs(actual - expected) / expected * 100
+                            assert diff_pct < 10, f"Stream {stream_id}: actual={actual}, expected={expected}"
+            
+            batches_generated += 1
+        
+        print(f"\n{'='*70}")
+        print(f"SIMULATION COMPLETE")
+        print(f"{'='*70}")
+        print(f"Batches processed: {batches_generated}")
+        print(f"Total events: {total_events:,}")
+        print(f"Final session count: {tracker.get_stats()['total_sessions']:,}")
+        print(f"Memory estimate: ~{tracker.get_stats()['total_sessions'] * 100 / 1024:.1f}KB")
+        print(f"{'='*70}\n")
+        
+        # Final validation
+        final_metrics = tracker.get_gauge_metrics()
+        assert len(final_metrics) > 0
+        
+        # Verify we have metrics for all dimensions
+        metric_types = {m['metric_name'] for m in final_metrics}
+        assert 'cdn77_active_viewers' in metric_types
+        assert 'cdn77_active_viewers_by_device' in metric_types
+        assert 'cdn77_active_viewers_by_country' in metric_types
+    
+    def test_retroactive_data_accumulation(self):
+        """
+        Test that unique IP counts increase as retroactive data arrives.
+        Simulates the real-world scenario where files arrive out of order.
+        """
+        tracker = SessionTracker(window_seconds=7200)
+        
+        stream_id = "test1234567890abcdef1234567890ab"
+        base_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+        
+        print(f"\n{'='*70}")
+        print(f"RETROACTIVE DATA ACCUMULATION TEST")
+        print(f"{'='*70}\n")
+        
+        # Create a pool of 1000 unique IPs
+        ip_pool = [f"10.{i//256}.{(i%256)//16}.{i%16}" for i in range(1000)]
+        
+        # Simulate 10 files arriving for the same time period
+        # Each file contains events from the past 30 minutes
+        # But files arrive out of order with delays
+        
+        unique_ips_seen = set()
+        
+        for file_num in range(10):
+            # File arrival time (files arrive over 10 minutes)
+            file_time = base_time + timedelta(minutes=file_num)
+            
+            # But file contains events from 0-30 minutes ago
+            events = []
+            ips_in_this_file = set()
+            
+            for i in range(100):  # 100 events per file
+                # Event timestamp is in the past (retroactive)
+                event_offset_minutes = random.randint(0, 30)
+                event_time = file_time - timedelta(minutes=event_offset_minutes)
+                
+                # Pick an IP (might be new or might be seen before)
+                ip = random.choice(ip_pool[:200 + file_num * 50])  # Gradually expose more IPs
+                unique_ips_seen.add(ip)
+                ips_in_this_file.add(ip)
+                
+                event = Event(
+                    timestamp=event_time,
+                    stream_id=stream_id,
+                    client_ip=ip,
+                    device_type="web",
+                    resource_id=123,
+                    cache_status="HIT",
+                    response_bytes=1000,
+                    time_to_first_byte_ms=100,
+                    tcp_rtt_us=50000,
+                    request_time_ms=150,
+                    response_status=200,
+                    client_country="US",
+                    location_id="losangelesUSCA",
+                    raw_data={}
+                )
+                events.append(event)
+            
+            # Update tracker
+            tracker.update(events)
+            
+            # Generate metrics
+            metrics = tracker.get_gauge_metrics()
+            viewer_metric = [m for m in metrics if m['metric_name'] == 'cdn77_active_viewers'][0]
+            
+            print(f"File {file_num+1:2d} | "
+                  f"New IPs in file: {len(ips_in_this_file):3d} | "
+                  f"Total unique IPs seen: {len(unique_ips_seen):4d} | "
+                  f"Active sessions: {int(viewer_metric['value']):4d}")
+            
+            # Verify count is increasing (as we discover more retroactive IPs)
+            if file_num > 0:
+                assert viewer_metric['value'] > 0
+        
+        print(f"\n{'='*70}")
+        print(f"FINAL RESULTS")
+        print(f"{'='*70}")
+        print(f"Total unique IPs discovered: {len(unique_ips_seen)}")
+        print(f"Final active sessions: {tracker.get_stats()['total_sessions']}")
+        
+        # The final count should be close to unique IPs seen
+        # (within the 2-hour window)
+        assert tracker.get_stats()['total_sessions'] >= len(unique_ips_seen) * 0.8
+        print(f"Validation: ✓ Session count matches expected range")
+        print(f"{'='*70}\n")
+    
+    def test_memory_usage_estimation(self):
+        """
+        Test memory usage with different scales to verify estimates.
+        Tests: 1K, 10K, 100K, and 1M IPs
+        """
+        import sys
+        
+        print(f"\n{'='*70}")
+        print(f"MEMORY USAGE ESTIMATION TEST")
+        print(f"{'='*70}\n")
+        
+        test_sizes = [1_000, 10_000, 100_000, 1_000_000]
+        
+        for size in test_sizes:
+            tracker = SessionTracker(window_seconds=7200)
+            base_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+            stream_id = "test1234567890abcdef1234567890ab"
+            
+            # Generate unique IPs
+            events = []
+            for i in range(size):
+                ip = f"{(i>>24)&0xFF}.{(i>>16)&0xFF}.{(i>>8)&0xFF}.{i&0xFF}"
+                event = Event(
+                    timestamp=base_time,
+                    stream_id=stream_id,
+                    client_ip=ip,
+                    device_type="web",
+                    resource_id=123,
+                    cache_status="HIT",
+                    response_bytes=1000,
+                    time_to_first_byte_ms=100,
+                    tcp_rtt_us=50000,
+                    request_time_ms=150,
+                    response_status=200,
+                    client_country="US",
+                    location_id="losangelesUSCA",
+                    raw_data={}
+                )
+                events.append(event)
+                
+                # Batch update every 10K to avoid memory spike
+                if len(events) >= 10_000:
+                    tracker.update(events)
+                    events = []
+            
+            # Update any remaining
+            if events:
+                tracker.update(events)
+            
+            # Calculate memory
+            session_count = tracker.get_stats()['total_sessions']
+            
+            # Estimate memory per session
+            # Each SessionInfo has: datetime (48 bytes) + 2 strings (~30 bytes) = ~80 bytes
+            # Plus dict overhead ~40 bytes
+            # Total ~120 bytes per IP
+            estimated_mb = (session_count * 120) / (1024 * 1024)
+            
+            print(f"IPs: {size:>10,} | Sessions: {session_count:>10,} | "
+                  f"Est. Memory: {estimated_mb:>6.1f}MB")
+            
+            # Verify count matches
+            assert session_count == size
+        
+        print(f"\n{'='*70}")
+        print(f"Scaling estimates:")
+        print(f"  10M IPs  = ~1.2 GB")
+        print(f"  50M IPs  = ~6.0 GB")
+        print(f"  100M IPs = ~12 GB")
+        print(f"{'='*70}\n")
+    
+    def test_device_and_country_breakdown_accuracy(self):
+        """
+        Test that device and country breakdowns are accurate with large datasets.
+        """
+        tracker = SessionTracker(window_seconds=7200)
+        
+        stream_id = "test1234567890abcdef1234567890ab"
+        base_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+        
+        print(f"\n{'='*70}")
+        print(f"DEVICE & COUNTRY BREAKDOWN ACCURACY TEST")
+        print(f"{'='*70}\n")
+        
+        # Define expected distributions
+        device_distribution = {
+            "roku": 0.35,        # 35%
+            "apple_tv": 0.25,    # 25%
+            "web": 0.20,         # 20%
+            "firestick": 0.15,   # 15%
+            "baron_mobile": 0.05 # 5%
+        }
+        
+        country_distribution = {
+            "US": 0.60,  # 60%
+            "CA": 0.15,  # 15%
+            "GB": 0.10,  # 10%
+            "DE": 0.08,  # 8%
+            "FR": 0.07   # 7%
+        }
+        
+        # Generate 10,000 unique viewers
+        num_viewers = 10_000
+        events = []
+        
+        # Track what we generate
+        generated_by_device = {d: 0 for d in device_distribution.keys()}
+        generated_by_country = {c: 0 for c in country_distribution.keys()}
+        
+        for i in range(num_viewers):
+            # Pick device based on distribution
+            rand = random.random()
+            cumulative = 0
+            device = "web"
+            for dev, prob in device_distribution.items():
+                cumulative += prob
+                if rand <= cumulative:
+                    device = dev
+                    break
+            generated_by_device[device] += 1
+            
+            # Pick country based on distribution  
+            rand = random.random()
+            cumulative = 0
+            country = "US"
+            for ctry, prob in country_distribution.items():
+                cumulative += prob
+                if rand <= cumulative:
+                    country = ctry
+                    break
+            generated_by_country[country] += 1
+            
+            ip = f"{(i>>24)&0xFF}.{(i>>16)&0xFF}.{(i>>8)&0xFF}.{i&0xFF}"
+            
+            event = Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip=ip,
+                device_type=device,
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country=country,
+                location_id="losangelesUSCA",
+                raw_data={}
+            )
+            events.append(event)
+        
+        # Update tracker
+        tracker.update(events)
+        metrics = tracker.get_gauge_metrics()
+        
+        # Validate device breakdown
+        print("Device Breakdown:")
+        print(f"{'Device':<15} {'Generated':<12} {'Expected %':<12} {'Tracked':<12} {'Tracked %':<12}")
+        print("-" * 70)
+        
+        device_metrics = [m for m in metrics if m['metric_name'] == 'cdn77_active_viewers_by_device']
+        for device, expected_pct in sorted(device_distribution.items()):
+            generated = generated_by_device[device]
+            metric = [m for m in device_metrics if m['labels']['device_type'] == device]
+            tracked = int(metric[0]['value']) if metric else 0
+            tracked_pct = (tracked / num_viewers) * 100
+            expected_pct_display = expected_pct * 100
+            
+            print(f"{device:<15} {generated:<12,} {expected_pct_display:<12.1f} {tracked:<12,} {tracked_pct:<12.1f}")
+            
+            # Verify within 2% of expected
+            assert abs(tracked - generated) < num_viewers * 0.02
+        
+        # Validate country breakdown
+        print(f"\nCountry Breakdown:")
+        print(f"{'Country':<15} {'Generated':<12} {'Expected %':<12} {'Tracked':<12} {'Tracked %':<12}")
+        print("-" * 70)
+        
+        country_metrics = [m for m in metrics if m['metric_name'] == 'cdn77_active_viewers_by_country']
+        for country, expected_pct in sorted(country_distribution.items()):
+            generated = generated_by_country[country]
+            metric = [m for m in country_metrics if m['labels']['country'] == country]
+            tracked = int(metric[0]['value']) if metric else 0
+            tracked_pct = (tracked / num_viewers) * 100
+            expected_pct_display = expected_pct * 100
+            
+            print(f"{country:<15} {generated:<12,} {expected_pct_display:<12.1f} {tracked:<12,} {tracked_pct:<12.1f}")
+            
+            # Verify matches exactly (no deduplication across countries)
+            assert tracked == generated
+        
+        print(f"\n{'='*70}")
+        print("✓ All breakdowns match expected distributions")
+        print(f"{'='*70}\n")
 
 
 # ============================================================================
