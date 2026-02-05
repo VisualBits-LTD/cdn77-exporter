@@ -13,7 +13,7 @@ Daemon service that polls CDN77 S3-compatible storage for real-time access logs 
 
 ## Metrics Exported
 
-The exporter generates 11 metrics with rich dimensional labels (stream_name, cdn_id, cache_status, pop, response_status, device_type, country, region):
+The exporter generates 12 metrics with rich dimensional labels (stream_name, cdn_id, cache_status, pop, response_status, device_type, country, region):
 
 ### Counters (use with `rate()` or `increase()`)
 
@@ -37,28 +37,36 @@ The exporter generates 11 metrics with rich dimensional labels (stream_name, cdn
 - Query 4xx error rate: `sum(rate(cdn77_responses_total{stream_name="...", response_status=~"4.."}[5m]))`
 - Query success rate: `sum(rate(cdn77_responses_total{stream_name="...", response_status="200"}[5m]))`
 
-**`cdn77_users_total`**
-- Count of unique IP addresses per stream (counter)
+**`cdn77_viewers_total`**
+- Count of unique IP addresses (viewers) per stream (counter)
 - Labels: `stream_name`
-- Query unique users per stream: `cdn77_users_total{stream_name="..."}`
-- Query total unique users across all streams: `sum(cdn77_users_total)`
-- Query unique users rate: `rate(cdn77_users_total{stream_name="..."}[5m])`
+- Query unique viewers per stream: `cdn77_viewers_total{stream_name="..."}`
+- Query total unique viewers across all streams: `sum(cdn77_viewers_total)`
+- Query unique viewers rate: `rate(cdn77_viewers_total{stream_name="..."}[5m])`
 
-**`cdn77_users_by_device_total`**
-- Count of unique IP addresses per stream by device type (counter)
+**`cdn77_viewers_by_device_total`**
+- Count of unique IP addresses (viewers) per stream by device type (counter)
 - Labels: `stream_name`, `device_type`
 - Device types: `baron_mobile`, `apple_tv`, `roku`, `firestick`, `android_tv`, `web`, `other`
-- Query Baron mobile vs OTT: `cdn77_users_by_device_total{stream_name="...", device_type=~"baron_mobile|apple_tv|roku|firestick"}`
-- Query by platform: `sum by (device_type) (cdn77_users_by_device_total{stream_name="..."})`
-- Compare platforms: `cdn77_users_by_device_total{stream_name="...", device_type="roku"}` vs `device_type="apple_tv"`
+- Query Baron mobile vs OTT: `cdn77_viewers_by_device_total{stream_name="...", device_type=~"baron_mobile|apple_tv|roku|firestick"}`
+- Query by platform: `sum by (device_type) (cdn77_viewers_by_device_total{stream_name="..."})`
+- Compare platforms: `cdn77_viewers_by_device_total{stream_name="...", device_type="roku"}` vs `device_type="apple_tv"`
 
-**`cdn77_users_by_country_total`**
-- Count of unique IP addresses per stream by country (counter)
+**`cdn77_viewers_by_country_total`**
+- Count of unique IP addresses (viewers) per stream by country (counter)
 - Labels: `stream_name`, `country`
 - Country from CDN77 logs (ISO 3166-1 alpha-2)
-- Query unique users per country: `cdn77_users_by_country_total{stream_name="...", country="US"}`
-- Query top countries: `topk(10, cdn77_users_by_country_total{stream_name="..."})`
-- Query growth rate: `rate(cdn77_users_by_country_total{stream_name="...", country="US"}[5m])`
+- Query unique viewers per country: `cdn77_viewers_by_country_total{stream_name="...", country="US"}`
+- Query top countries: `topk(10, cdn77_viewers_by_country_total{stream_name="..."})`
+- Query growth rate: `rate(cdn77_viewers_by_country_total{stream_name="...", country="US"}[5m])`
+
+**`cdn77_viewers_by_region_total`**
+- Count of unique IP addresses (viewers) per stream by country and region/state (counter)
+- Labels: `stream_name`, `country`, `region`
+- Requires GeoIP database for region lookup (see setup below)
+- Query unique viewers per region: `cdn77_viewers_by_region_total{stream_name="...", country="US", region="California"}`
+- Query top regions: `topk(10, cdn77_viewers_by_region_total{stream_name="..."})`
+- Query US states: `cdn77_viewers_by_region_total{stream_name="...", country="US"}`
 
 ### Gauges (use with `max_over_time()` or direct value)
 
@@ -180,7 +188,7 @@ Files contain approximately 30 seconds of log data, delivered with minimal laten
 
 ## GeoIP Setup (Optional)
 
-For geographic metrics (`cdn77_active_viewers_by_country` and `cdn77_active_viewers_by_region`), download the MaxMind GeoLite2 database:
+For region-based metrics (`cdn77_viewers_by_region_total`, `cdn77_active_viewers_by_country`, `cdn77_active_viewers_by_region`), download the MaxMind GeoLite2 database:
 
 1. **Sign up for free MaxMind account:** https://dev.maxmind.com/geoip/geolite2-free-geolocation-data
 2. **Download GeoLite2-City.mmdb** (~70MB)
@@ -194,9 +202,15 @@ For geographic metrics (`cdn77_active_viewers_by_country` and `cdn77_active_view
    GEOIP_DB_PATH: /app/GeoLite2-City.mmdb
    ```
 
-**Performance:** 1-5 microseconds per lookup, ~50MB memory overhead
+**Performance Optimization:**
+- Lookups happen **after deduplication** (once per unique IP, not per event)
+- Results are **cached in memory** for the lifetime of the exporter
+- Typical reduction: 90%+ fewer lookups vs naive per-event approach
+- Example: 1000 events from 100 unique IPs = 100 lookups instead of 1000
+- Memory overhead: ~70MB for database + ~120 bytes per cached IP
+- Lookup speed: 1-5 microseconds per uncached IP
 
-**Without GeoIP:** Geographic metrics will show country="XX" and region="Unknown"
+**Without GeoIP:** Region-based counter metrics won't be generated; gauge metrics will show country="XX" and region="Unknown"
 
 ## Usage
 
@@ -280,7 +294,7 @@ python s3_importer.py
 
 **Processing Flow:**
 ```
-S3 Bucket → Download (chronological) → Parse JSON → Event Buffer → 
+S3 Bucket → Download (chronological) → Parse JSON → Event Buffer →
 Aggregate by Minute+Labels → Apply Offset → Push to Prometheus → Delete from S3
 ```
 
@@ -293,7 +307,9 @@ Aggregate by Minute+Labels → Apply Offset → Push to Prometheus → Delete fr
 ## Performance
 
 - **Memory**: ~50-100MB for typical 30-second log files (~16K lines)
+- **GeoIP Cache**: ~120 bytes per unique IP address (persistent across batches)
 - **Processing**: ~1 second per file (download, parse, aggregate, push)
+- **GeoIP Optimization**: 90%+ reduction via deduplication + in-memory caching
 - **Compression**: ~88% (protobuf + snappy for Prometheus remote write)
 - **Latency**: ~30-90 seconds from log generation to Prometheus ingestion
 - **Backfill**: 7-day window (older data filtered by Prometheus)

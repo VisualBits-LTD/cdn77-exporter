@@ -71,7 +71,8 @@ class Event:
     location_id: str
     client_ip: str
     device_type: str
-    raw_data: Dict[str, Any]  # Full JSON for future extensibility
+    client_region: Optional[str] = None  # State/region from GeoIP lookup (optional)
+    raw_data: Dict[str, Any] = None  # Full JSON for future extensibility
     
     @property
     def minute_key(self) -> str:
@@ -477,6 +478,9 @@ def extract_client_ip(event: Event) -> str:
 def extract_device_type(event: Event) -> str:
     return event.device_type
 
+def extract_client_region(event: Event) -> str:
+    return event.client_region if event.client_region else "unknown"
+
 
 # Metric definitions
 METRIC_DEFINITIONS = [
@@ -530,33 +534,45 @@ METRIC_DEFINITIONS = [
         help_text="Request count by HTTP response status code"
     ),
     MetricDefinition(
-        name="cdn77_users_total",
+        name="cdn77_viewers_total",
         value_extractor=lambda e: e.client_ip,  # Value is the IP address itself
         aggregation=AggregationType.UNIQUE_COUNT,
         labels={
             "stream_name": extract_stream_id,
         },
-        help_text="Count of unique IP addresses per stream"
+        help_text="Count of unique IP addresses (viewers) per stream"
     ),
     MetricDefinition(
-        name="cdn77_users_by_device_total",
+        name="cdn77_viewers_by_device_total",
         value_extractor=lambda e: e.client_ip,  # Value is the IP address itself
         aggregation=AggregationType.UNIQUE_COUNT,
         labels={
             "stream_name": extract_stream_id,
             "device_type": extract_device_type,
         },
-        help_text="Count of unique IP addresses per stream by device type"
+        help_text="Count of unique IP addresses (viewers) per stream by device type"
     ),
     MetricDefinition(
-        name="cdn77_users_by_country_total",
+        name="cdn77_viewers_by_country_total",
         value_extractor=lambda e: e.client_ip,  # Value is the IP address itself
         aggregation=AggregationType.UNIQUE_COUNT,
         labels={
             "stream_name": extract_stream_id,
             "country": extract_client_country,
         },
-        help_text="Count of unique IP addresses per stream by country"
+        help_text="Count of unique IP addresses (viewers) per stream by country"
+    ),
+    MetricDefinition(
+        name="cdn77_viewers_by_region_total",
+        value_extractor=lambda e: e.client_ip,  # Value is the IP address itself
+        aggregation=AggregationType.UNIQUE_COUNT,
+        labels={
+            "stream_name": extract_stream_id,
+            "country": extract_client_country,
+            # NOTE: 'region' label is added later in compute_final_values() via GeoIP lookup
+            # after deduplication. This avoids doing GeoIP lookups for every event.
+        },
+        help_text="Count of unique IP addresses (viewers) per stream by country and region"
     ),
 ]
 
@@ -649,10 +665,37 @@ class LogParser:
     # Regex to extract stream ID (hex hash) from path like: /HASH/filename
     STREAM_PATTERN = re.compile(r'^/([a-f0-9]+)/')
     
-    def __init__(self):
+    def __init__(self, geoip_db_path: Optional[str] = None):
         self.debug_count = 0
         self.success_count = 0
         self.timestamp_cache = {}
+        
+        # GeoIP lookup
+        self.geoip_reader = None
+        if geoip_db_path and GEOIP_AVAILABLE:
+            try:
+                self.geoip_reader = geoip2.database.Reader(geoip_db_path)
+                logger.info(f"GeoIP database loaded for LogParser: {geoip_db_path}")
+            except Exception as e:
+                logger.warning(f"Failed to load GeoIP database in LogParser: {e}")
+    
+    def lookup_geo(self, ip_address: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Lookup country and region for IP address
+        
+        Returns:
+            Tuple of (country_code, region_name) or (None, None) if not available
+        """
+        if not self.geoip_reader:
+            return (None, None)
+        
+        try:
+            response = self.geoip_reader.city(ip_address)
+            country = response.country.iso_code or None
+            region = response.subdivisions.most_specific.name if response.subdivisions else None
+            return (country, region)
+        except Exception:
+            return (None, None)
     
     def parse_json_to_event(self, line: str) -> Optional[Event]:
         """
@@ -716,6 +759,11 @@ class LogParser:
             
             # Create Event object
             user_agent = data.get('clientRequestUserAgent', '')
+            client_ip = data.get('clientIP', '0.0.0.0')
+            
+            # Note: GeoIP lookup for region happens during aggregation (after deduplication)
+            # to avoid redundant lookups for the same IP
+            
             event = Event(
                 timestamp=dt,
                 stream_id=stream_id,
@@ -728,8 +776,9 @@ class LogParser:
                 response_status=data.get('responseStatus', 0),
                 client_country=data.get('clientCountry', 'XX'),
                 location_id=data.get('locationID', 'unknown'),
-                client_ip=data.get('clientIP', '0.0.0.0'),
+                client_ip=client_ip,
                 device_type=detect_device_type(user_agent),
+                client_region=None,  # Will be populated during aggregation if GeoIP available
                 raw_data=data
             )
             
@@ -820,8 +869,39 @@ class LogParser:
 class MetricAggregator:
     """Aggregates events into multiple metrics based on metric definitions"""
     
-    def __init__(self, metric_definitions: List[MetricDefinition]):
+    def __init__(self, metric_definitions: List[MetricDefinition], geoip_db_path: Optional[str] = None):
         self.metric_definitions = metric_definitions
+        self.ip_to_region_cache = {}  # Cache: {ip: region_name or None}
+        
+        # GeoIP lookup for post-deduplication region enrichment
+        self.geoip_reader = None
+        if geoip_db_path and GEOIP_AVAILABLE:
+            try:
+                self.geoip_reader = geoip2.database.Reader(geoip_db_path)
+                logger.info(f"GeoIP database loaded for MetricAggregator: {geoip_db_path}")
+            except Exception as e:
+                logger.warning(f"Failed to load GeoIP database in MetricAggregator: {e}")
+    
+    def lookup_region(self, ip_address: str) -> Optional[str]:
+        """Lookup region for IP address with caching (called only for unique IPs after deduplication)"""
+        # Check cache first
+        if ip_address in self.ip_to_region_cache:
+            return self.ip_to_region_cache[ip_address]
+        
+        # If no GeoIP reader, cache as None and return
+        if not self.geoip_reader:
+            self.ip_to_region_cache[ip_address] = None
+            return None
+        
+        # Perform lookup and cache result
+        try:
+            response = self.geoip_reader.city(ip_address)
+            region = response.subdivisions.most_specific.name if response.subdivisions else None
+            self.ip_to_region_cache[ip_address] = region
+            return region
+        except Exception:
+            self.ip_to_region_cache[ip_address] = None
+            return None
     
     def aggregate_events(self, events: List[Event]) -> Dict[str, Dict[Tuple[str, ...], any]]:
         """
@@ -893,6 +973,39 @@ class MetricAggregator:
                     final_value = len(values)
                 elif metric_def.aggregation == AggregationType.UNIQUE_COUNT:
                     # values is a set for UNIQUE_COUNT
+                    # For region-based metrics, enrich IPs with GeoIP lookup AFTER deduplication
+                    if metric_def.name == 'cdn77_viewers_by_region_total' and self.geoip_reader:
+                        # values is a set of IPs - lookup region for each unique IP
+                        # Group by region and count unique IPs per region
+                        region_ip_sets = {}  # {region: set of IPs}
+                        
+                        for ip in values:
+                            region = self.lookup_region(ip)
+                            if region:
+                                if region not in region_ip_sets:
+                                    region_ip_sets[region] = set()
+                                region_ip_sets[region].add(ip)
+                        
+                        # Reconstruct labels dict from tuple
+                        all_label_keys = sorted(list(metric_def.labels.keys()) + ['minute'])
+                        labels_dict = dict(zip(all_label_keys, label_tuple))
+                        
+                        # Generate separate metric for each region
+                        for region, ip_set in region_ip_sets.items():
+                            # Update labels to include region
+                            region_labels = dict(labels_dict)
+                            region_labels['region'] = region
+                            
+                            results.append({
+                                'metric_name': metric_def.name,
+                                'labels': region_labels,
+                                'value': float(len(ip_set)),
+                                'minute_key': labels_dict['minute']
+                            })
+                        
+                        # Skip the normal append below for this metric
+                        continue
+                    
                     final_value = len(values)
                 else:
                     logger.warning(f"Unknown aggregation type: {metric_def.aggregation}")
@@ -1153,12 +1266,13 @@ class S3Importer:
                  prometheus_user: Optional[str] = None, prometheus_password: Optional[str] = None,
                  s3_prefix: str = 'real-time-logs/logs',
                  metric_definitions: List[MetricDefinition] = None,
-                 flush_delay_seconds: int = 180):
+                 flush_delay_seconds: int = 180,
+                 geoip_db_path: Optional[str] = None):
         self.s3_client = s3_client
         self.s3_prefix = s3_prefix.rstrip('/')  # Remove trailing slash
-        self.parser = LogParser()
+        self.parser = LogParser(geoip_db_path=geoip_db_path)
         self.shutdown_requested = False
-        self.aggregator = MetricAggregator(metric_definitions or METRIC_DEFINITIONS)
+        self.aggregator = MetricAggregator(metric_definitions or METRIC_DEFINITIONS, geoip_db_path=geoip_db_path)
         self.exporter = PrometheusExporter(prometheus_url, prometheus_user, prometheus_password)
         self.write_queue = queue.Queue(maxsize=100)
         
@@ -1470,6 +1584,8 @@ def main():
                        help='How many hours back to look for files (default: 2)')
     parser.add_argument('--flush-delay', type=int, default=60,
                        help='Wait this many seconds before flushing events (default: 60)')
+    parser.add_argument('--geoip-db-path', default=os.getenv('GEOIP_DB_PATH'),
+                       help='Path to MaxMind GeoIP2 database file (optional, or GEOIP_DB_PATH env var)')
     
     args = parser.parse_args()
     
@@ -1503,7 +1619,8 @@ def main():
         prometheus_user=args.prometheus_user,
         prometheus_password=args.prometheus_password,
         s3_prefix=args.s3_prefix,
-        flush_delay_seconds=args.flush_delay
+        flush_delay_seconds=args.flush_delay,
+        geoip_db_path=args.geoip_db_path
     )
     
     # Setup signal handlers for graceful shutdown

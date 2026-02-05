@@ -250,10 +250,10 @@ class TestMetricAggregation:
         aggregated = aggregator.aggregate_events(events)
         computed = aggregator.compute_final_values(aggregated)
         
-        # Find users metric
-        users_metric = [m for m in computed if m['metric_name'] == 'cdn77_users_total'][0]
-        assert users_metric['value'] == 5  # Should count 5 unique IPs
-        assert users_metric['labels']['stream_name'] == stream_id
+        # Find viewers metric
+        viewers_metric = [m for m in computed if m['metric_name'] == 'cdn77_viewers_total'][0]
+        assert viewers_metric['value'] == 5  # Should count 5 unique IPs
+        assert viewers_metric['labels']['stream_name'] == stream_id
     
     def test_unique_ip_per_stream(self):
         """Test unique IP counting per stream (separate counts)"""
@@ -283,11 +283,11 @@ class TestMetricAggregation:
         aggregated = aggregator.aggregate_events(events)
         computed = aggregator.compute_final_values(aggregated)
         
-        # Find users metrics for each stream
-        users_metrics = [m for m in computed if m['metric_name'] == 'cdn77_users_total']
+        # Find viewers metrics for each stream
+        viewers_metrics = [m for m in computed if m['metric_name'] == 'cdn77_viewers_total']
         
-        stream1_metric = [m for m in users_metrics if m['labels']['stream_name'] == stream1][0]
-        stream2_metric = [m for m in users_metrics if m['labels']['stream_name'] == stream2][0]
+        stream1_metric = [m for m in viewers_metrics if m['labels']['stream_name'] == stream1][0]
+        stream2_metric = [m for m in viewers_metrics if m['labels']['stream_name'] == stream2][0]
         
         assert stream1_metric['value'] == 3
         assert stream2_metric['value'] == 2
@@ -472,7 +472,7 @@ class TestDeviceDetection:
         assert event is not None
         assert event.device_type == "roku"
     
-    def test_unique_users_by_device(self):
+    def test_unique_viewers_by_device(self):
         """Test unique IP counting per device type"""
         parser = LogParser()
         aggregator = MetricAggregator(METRIC_DEFINITIONS)
@@ -509,8 +509,8 @@ class TestDeviceDetection:
         aggregated = aggregator.aggregate_events(events)
         computed = aggregator.compute_final_values(aggregated)
         
-        # Find users_by_device metrics
-        device_metrics = [m for m in computed if m['metric_name'] == 'cdn77_users_by_device_total']
+        # Find viewers_by_device metrics
+        device_metrics = [m for m in computed if m['metric_name'] == 'cdn77_viewers_by_device_total']
         
         roku_metric = [m for m in device_metrics if m['labels']['device_type'] == 'roku'][0]
         apple_tv_metric = [m for m in device_metrics if m['labels']['device_type'] == 'apple_tv'][0]
@@ -518,7 +518,7 @@ class TestDeviceDetection:
         assert roku_metric['value'] == 2  # 2 unique IPs on Roku
         assert apple_tv_metric['value'] == 2  # 2 unique IPs on Apple TV
     
-    def test_unique_users_by_country(self):
+    def test_unique_viewers_by_country(self):
         """Test unique IP counting per country"""
         parser = LogParser()
         aggregator = MetricAggregator(METRIC_DEFINITIONS)
@@ -613,14 +613,152 @@ class TestDeviceDetection:
         aggregated = aggregator.aggregate_events(events)
         computed = aggregator.compute_final_values(aggregated)
         
-        # Find users_by_country metrics
-        country_metrics = [m for m in computed if m['metric_name'] == 'cdn77_users_by_country_total']
+        # Find viewers_by_country metrics
+        country_metrics = [m for m in computed if m['metric_name'] == 'cdn77_viewers_by_country_total']
         
         us_metric = [m for m in country_metrics if m['labels']['country'] == 'US'][0]
         ca_metric = [m for m in country_metrics if m['labels']['country'] == 'CA'][0]
         
         assert us_metric['value'] == 2  # 2 unique IPs from US
         assert ca_metric['value'] == 2  # 2 unique IPs from CA
+    
+    def test_unique_viewers_by_region(self):
+        """Test unique IP counting per region with GeoIP lookup"""
+        from unittest.mock import Mock
+        
+        parser = LogParser()
+        aggregator = MetricAggregator(METRIC_DEFINITIONS, geoip_db_path=None)
+        
+        # Mock GeoIP reader with different regions per IP
+        def mock_city_lookup(ip):
+            """Return different regions based on IP"""
+            mock_response = Mock()
+            mock_subdivision = Mock()
+            mock_subdivisions = Mock()
+            
+            if ip == "10.0.0.1" or ip == "10.0.0.2":
+                mock_subdivision.name = "California"
+            elif ip == "10.0.0.3":
+                mock_subdivision.name = "Texas"
+            elif ip == "10.0.0.4":
+                mock_subdivision.name = "Ontario"
+            else:
+                mock_subdivision.name = "Unknown"
+            
+            mock_subdivisions.most_specific = mock_subdivision
+            mock_response.subdivisions = mock_subdivisions
+            return mock_response
+        
+        mock_reader = Mock()
+        mock_reader.city.side_effect = mock_city_lookup
+        aggregator.geoip_reader = mock_reader
+        
+        base_time = datetime(2026, 1, 28, 12, 30, 0, tzinfo=timezone.utc)
+        stream_id = "abcd1234567890abcdef1234567890ab"
+        
+        # Create events without client_region (will be looked up via GeoIP)
+        events = [
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="losangelesUSCA",
+                raw_data={}
+            ),
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.2",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="losangelesUSCA",
+                raw_data={}
+            ),
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",  # Duplicate IP from CA
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="losangelesUSCA",
+                raw_data={}
+            ),
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.3",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="losangelesUSCA",
+                raw_data={}
+            ),
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.4",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="CA",
+                location_id="losangelesUSCA",
+                raw_data={}
+            ),
+        ]
+        
+        aggregated = aggregator.aggregate_events(events)
+        computed = aggregator.compute_final_values(aggregated)
+        
+        # Find viewers_by_region metrics
+        region_metrics = [m for m in computed if m['metric_name'] == 'cdn77_viewers_by_region_total']
+        
+        # Should have 3 region combinations: US/California (2 IPs), US/Texas (1 IP), CA/Ontario (1 IP)
+        assert len(region_metrics) == 3
+        
+        us_ca_metric = [m for m in region_metrics if m['labels']['country'] == 'US' and m['labels']['region'] == 'California'][0]
+        us_tx_metric = [m for m in region_metrics if m['labels']['country'] == 'US' and m['labels']['region'] == 'Texas'][0]
+        ca_on_metric = [m for m in region_metrics if m['labels']['country'] == 'CA' and m['labels']['region'] == 'Ontario'][0]
+        
+        assert us_ca_metric['value'] == 2  # 2 unique IPs from US/California
+        assert us_tx_metric['value'] == 1  # 1 unique IP from US/Texas
+        assert ca_on_metric['value'] == 1  # 1 unique IP from CA/Ontario
+        
+        # Verify GeoIP was called for each unique IP (4 unique IPs)
+        assert mock_reader.city.call_count == 4
 
 
 class TestIntegration:
@@ -669,13 +807,13 @@ class TestIntegration:
             'cdn77_time_to_first_byte_ms',
             'cdn77_requests_total',
             'cdn77_responses_total',
-            'cdn77_users_total'
+            'cdn77_viewers_total'
         }
         assert expected_metrics.issubset(metric_names)
         
-        # Verify users_total has one entry per stream
-        users_metrics = [m for m in computed if m['metric_name'] == 'cdn77_users_total']
-        assert len(users_metrics) >= 1  # At least one stream has data
+        # Verify viewers_total has one entry per stream
+        viewers_metrics = [m for m in computed if m['metric_name'] == 'cdn77_viewers_total']
+        assert len(viewers_metrics) >= 1  # At least one stream has data
         
         # Verify total requests = 500
         requests_metrics = [m for m in computed if m['metric_name'] == 'cdn77_requests_total']
@@ -707,11 +845,11 @@ class TestIntegration:
         computed = aggregator.compute_final_values(aggregated)
         
         # Should have separate metrics for each minute
-        users_metrics = [m for m in computed if m['metric_name'] == 'cdn77_users_total']
+        viewers_metrics = [m for m in computed if m['metric_name'] == 'cdn77_viewers_total']
         
         # Each minute should show 5 unique IPs
-        assert len(users_metrics) == 3
-        for metric in users_metrics:
+        assert len(viewers_metrics) == 3
+        for metric in viewers_metrics:
             assert metric['value'] == 5
 
 
@@ -763,6 +901,152 @@ class TestPerformance:
         assert len(computed) > 0
         assert elapsed < 0.5  # Should aggregate in under 0.5 seconds
         print(f"\nAggregated 1000 events in {elapsed:.3f}s")
+    
+    def test_geoip_deduplication_efficiency(self):
+        """
+        Test that GeoIP lookups happen AFTER deduplication.
+        With 1000 events from 100 unique IPs, we should only do 100 lookups, not 1000.
+        """
+        import time
+        from unittest.mock import Mock, patch
+        
+        # Create aggregator without real GeoIP (we'll mock it)
+        aggregator = MetricAggregator(METRIC_DEFINITIONS, geoip_db_path=None)
+        
+        # Mock the GeoIP reader and track lookup calls
+        mock_reader = Mock()
+        mock_city_response = Mock()
+        mock_subdivision = Mock()
+        mock_subdivision.name = "California"
+        mock_subdivisions = Mock()
+        mock_subdivisions.most_specific = mock_subdivision
+        mock_city_response.subdivisions = mock_subdivisions
+        mock_reader.city.return_value = mock_city_response
+        
+        aggregator.geoip_reader = mock_reader
+        
+        # Generate 1000 events from 100 unique IPs (10 events per IP)
+        base_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+        stream_id = "abcd1234567890abcdef1234567890ab"
+        
+        unique_ips = [f"10.0.{i//256}.{i%256}" for i in range(100)]
+        events = []
+        
+        for i in range(1000):
+            ip = unique_ips[i % 100]  # Repeat IPs to simulate real traffic
+            events.append(Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip=ip,
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="losangelesUSCA",
+                raw_data={}
+            ))
+        
+        # Aggregate and compute
+        start_time = time.time()
+        aggregated = aggregator.aggregate_events(events)
+        computed = aggregator.compute_final_values(aggregated)
+        elapsed = time.time() - start_time
+        
+        # Verify we only looked up each unique IP once (100 times, not 1000)
+        lookup_count = mock_reader.city.call_count
+        
+        print(f"\n1000 events, 100 unique IPs")
+        print(f"GeoIP lookups: {lookup_count} (expected ~100, not 1000)")
+        print(f"Lookup efficiency: {(1 - lookup_count/1000)*100:.1f}% reduction")
+        print(f"Aggregation time: {elapsed:.3f}s")
+        
+        # Should be ~100 lookups (one per unique IP), not 1000
+        assert lookup_count <= 150, f"Too many lookups: {lookup_count} (expected ~100)"
+        assert lookup_count >= 50, f"Too few lookups: {lookup_count} (expected ~100)"
+        
+        # Verify metrics were generated correctly
+        region_metrics = [m for m in computed if m['metric_name'] == 'cdn77_viewers_by_region_total']
+        assert len(region_metrics) > 0
+    
+    def test_geoip_cache_across_batches(self):
+        """
+        Test that GeoIP lookups are cached across multiple batches.
+        Same IPs appearing in different batches should only be looked up once.
+        """
+        import time
+        from unittest.mock import Mock
+        
+        # Create aggregator without real GeoIP (we'll mock it)
+        aggregator = MetricAggregator(METRIC_DEFINITIONS, geoip_db_path=None)
+        
+        # Mock the GeoIP reader and track lookup calls
+        mock_reader = Mock()
+        mock_city_response = Mock()
+        mock_subdivision = Mock()
+        mock_subdivision.name = "California"
+        mock_subdivisions = Mock()
+        mock_subdivisions.most_specific = mock_subdivision
+        mock_city_response.subdivisions = mock_subdivisions
+        mock_reader.city.return_value = mock_city_response
+        
+        aggregator.geoip_reader = mock_reader
+        
+        # Generate 3 batches with overlapping IPs
+        base_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+        stream_id = "abcd1234567890abcdef1234567890ab"
+        
+        # 10 unique IPs that will appear in all 3 batches
+        unique_ips = [f"10.0.0.{i}" for i in range(10)]
+        
+        # Process 3 batches
+        for batch_num in range(3):
+            events = []
+            batch_time = base_time + timedelta(minutes=batch_num)
+            
+            # Each batch has same 10 IPs appearing 10 times each (100 events per batch)
+            for i in range(100):
+                ip = unique_ips[i % 10]
+                events.append(Event(
+                    timestamp=batch_time,
+                    stream_id=stream_id,
+                    client_ip=ip,
+                    device_type="web",
+                    resource_id=123,
+                    cache_status="HIT",
+                    response_bytes=1000,
+                    time_to_first_byte_ms=100,
+                    tcp_rtt_us=50000,
+                    request_time_ms=150,
+                    response_status=200,
+                    client_country="US",
+                    location_id="losangelesUSCA",
+                    raw_data={}
+                ))
+            
+            # Process batch
+            aggregated = aggregator.aggregate_events(events)
+            computed = aggregator.compute_final_values(aggregated)
+            
+            # Verify metrics were generated
+            region_metrics = [m for m in computed if m['metric_name'] == 'cdn77_viewers_by_region_total']
+            assert len(region_metrics) > 0
+        
+        # Verify GeoIP was only called 10 times total (once per unique IP), not 30 times (10 per batch)
+        total_lookups = mock_reader.city.call_count
+        
+        print(f"\n3 batches, 10 unique IPs per batch (same IPs)")
+        print(f"Total GeoIP lookups: {total_lookups} (expected 10, not 30)")
+        print(f"Cache efficiency: {(1 - total_lookups/30)*100:.1f}% reduction")
+        print(f"Cache size: {len(aggregator.ip_to_region_cache)}")
+        
+        # Should only lookup each IP once across all batches
+        assert total_lookups == 10, f"Expected 10 lookups (one per unique IP), got {total_lookups}"
+        assert len(aggregator.ip_to_region_cache) == 10, "Cache should contain 10 IPs"
 
 
 class TestSessionTracker:
