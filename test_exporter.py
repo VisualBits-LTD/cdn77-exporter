@@ -19,6 +19,7 @@ from exporter import (
     Event, LogParser, MetricAggregator, AggregationType,
     MetricDefinition, METRIC_DEFINITIONS, detect_device_type,
     SessionTracker, SessionInfo,
+    build_file_viewer_metrics,
     PrometheusWriterThread,
     extract_stream_id, extract_cdn_id, extract_cache_status,
     extract_location_id, extract_response_status, extract_client_ip, extract_device_type
@@ -1111,7 +1112,7 @@ class TestSessionTracker:
         assert fake_reader.calls == 1
 
     def test_region_metric_has_expected_labels(self):
-        """Region metric should include stream/country/region/window labels."""
+        """Region metric should include stream/country/region labels."""
         tracker = SessionTracker(window_seconds=300)
         tracker.geoip_reader = object()
 
@@ -1164,8 +1165,7 @@ class TestSessionTracker:
         assert len(region_metrics) == 2
         for metric in region_metrics:
             labels = metric['labels']
-            assert set(labels.keys()) == {'stream', 'country', 'region', 'window'}
-            assert labels['window'] == '5m'
+            assert set(labels.keys()) == {'stream', 'country', 'region'}
             assert labels['region'] != 'Unknown'
 
     def test_sum_by_country_matches_region_rollup(self):
@@ -1221,6 +1221,193 @@ class TestSessionTracker:
         assert region_sum_by_country == country_values
         assert region_sum_by_country['US'] == 2.0
         assert region_sum_by_country['AU'] == 2.0
+
+    def test_unique_metrics_respect_window_cutoff(self):
+        """Unique metrics should only include sessions seen within configured window."""
+        tracker = SessionTracker(window_seconds=7200)
+
+        now = datetime.now(timezone.utc)
+        stream_id = "abcd1234567890abcdef1234567890ab"
+
+        recent_event = Event(
+            timestamp=now - timedelta(minutes=20),
+            stream_id=stream_id,
+            client_ip="10.0.0.1",
+            device_type="web",
+            resource_id=123,
+            cache_status="HIT",
+            response_bytes=1000,
+            time_to_first_byte_ms=100,
+            tcp_rtt_us=50000,
+            request_time_ms=150,
+            response_status=200,
+            client_country="US",
+            location_id="testPOP",
+            raw_data={},
+        )
+        old_event = Event(
+            timestamp=now - timedelta(minutes=90),
+            stream_id=stream_id,
+            client_ip="10.0.0.2",
+            device_type="roku",
+            resource_id=123,
+            cache_status="HIT",
+            response_bytes=1000,
+            time_to_first_byte_ms=100,
+            tcp_rtt_us=50000,
+            request_time_ms=150,
+            response_status=200,
+            client_country="US",
+            location_id="testPOP",
+            raw_data={},
+        )
+
+        tracker.update([recent_event, old_event])
+        metrics = tracker.get_unique_metrics(window_seconds=3600, window_label='1h')
+
+        total_metric = [m for m in metrics if m['metric_name'] == 'cdn77_viewers_unique'][0]
+        assert total_metric['value'] == 1.0
+        assert total_metric['labels']['window'] == '1h'
+
+    def test_unique_metrics_include_expected_metric_names(self):
+        """Unique metrics should emit total/device/country/region series with window label."""
+        tracker = SessionTracker(window_seconds=7200)
+        tracker.geoip_reader = object()
+        tracker.lookup_geo = lambda ip: ("US", "California")
+
+        event = Event(
+            timestamp=datetime.now(timezone.utc),
+            stream_id="abcd1234567890abcdef1234567890ab",
+            client_ip="10.0.0.1",
+            device_type="web",
+            resource_id=123,
+            cache_status="HIT",
+            response_bytes=1000,
+            time_to_first_byte_ms=100,
+            tcp_rtt_us=50000,
+            request_time_ms=150,
+            response_status=200,
+            client_country="US",
+            location_id="testPOP",
+            raw_data={},
+        )
+
+        tracker.update([event])
+        metrics = tracker.get_unique_metrics(window_seconds=3600, window_label='1h')
+
+        metric_names = {m['metric_name'] for m in metrics}
+        assert 'cdn77_viewers_unique' in metric_names
+        assert 'cdn77_viewers_unique_by_device' in metric_names
+        assert 'cdn77_viewers_unique_by_country' in metric_names
+        assert 'cdn77_viewers_unique_by_region' in metric_names
+
+        for metric in metrics:
+            assert metric['labels']['window'] == '1h'
+
+
+class TestFileViewerMetrics:
+    """Tests for per-file/flush viewer metric construction."""
+
+    def test_build_file_viewer_metrics_unique_ips_per_dimension(self):
+        base_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+        stream_id = "abcd1234567890abcdef1234567890ab"
+
+        events = [
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="roku",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="testPOP",
+                raw_data={},
+            ),
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="roku",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="testPOP",
+                raw_data={},
+            ),
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.2",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="testPOP",
+                raw_data={},
+            ),
+        ]
+
+        geo = {
+            "10.0.0.1": ("US", "California"),
+            "10.0.0.2": ("US", "Texas"),
+        }
+        metrics = build_file_viewer_metrics(
+            events,
+            timestamp_ms=1234567890000,
+            geo_lookup=lambda ip: geo.get(ip, ("XX", "Unknown")),
+        )
+
+        metric_map = {m['metric']: m['value'] for m in metrics}
+
+        assert metric_map[f'cdn77_viewers{{stream="{stream_id}"}}'] == 2.0
+        assert metric_map[f'cdn77_viewers_by_device{{stream="{stream_id}",device_type="roku"}}'] == 1.0
+        assert metric_map[f'cdn77_viewers_by_device{{stream="{stream_id}",device_type="web"}}'] == 1.0
+        assert metric_map[f'cdn77_viewers_by_country{{stream="{stream_id}",country="US"}}'] == 2.0
+        assert metric_map[f'cdn77_viewers_by_region{{stream="{stream_id}",country="US",region="California"}}'] == 1.0
+        assert metric_map[f'cdn77_viewers_by_region{{stream="{stream_id}",country="US",region="Texas"}}'] == 1.0
+
+    def test_build_file_viewer_metrics_skips_unknown_region(self):
+        event = Event(
+            timestamp=datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc),
+            stream_id="abcd1234567890abcdef1234567890ab",
+            client_ip="10.0.0.3",
+            device_type="web",
+            resource_id=123,
+            cache_status="HIT",
+            response_bytes=1000,
+            time_to_first_byte_ms=100,
+            tcp_rtt_us=50000,
+            request_time_ms=150,
+            response_status=200,
+            client_country="US",
+            location_id="testPOP",
+            raw_data={},
+        )
+
+        metrics = build_file_viewer_metrics(
+            [event],
+            timestamp_ms=1234567890000,
+            geo_lookup=lambda _ip: ("US", "Unknown"),
+        )
+
+        metric_names = [m['metric'].split('{')[0] for m in metrics]
+        assert 'cdn77_viewers_by_region' not in metric_names
 
 
 class TestSessionTrackerSimulation:

@@ -18,7 +18,7 @@ Copilot context for this repository: [`.github/copilot-instructions.md`](.github
 Metric names are prefixed by `METRIC_PREFIX` (default: `cdn_`).
 Examples below use the `cdn_` prefix.
 
-The exporter generates 11 metrics with rich dimensional labels (stream, cdn_id, cache_status, pop, response_status, device_type, country, region):
+The exporter generates 15 metrics with rich dimensional labels (stream, cdn_id, cache_status, pop, response_status, device_type, country, region):
 
 ### Counters (use with `rate()` or `increase()`)
 
@@ -68,32 +68,53 @@ The exporter generates 11 metrics with rich dimensional labels (stream, cdn_id, 
 ### Gauges (use with `max_over_time()` or direct value)
 
 **`cdn_viewers`**
-- Current unique viewers in rolling time window (gauge)
-- Labels: `stream`, `window`
-- Tracks unique IPs over 2-hour rolling window (handles retroactive data)
-- Query current unique viewers: `cdn_viewers{stream="...", window="2h"}`
-- Query peak during broadcast: `max_over_time(cdn_viewers{stream="...", window="2h"}[3h])`
-- Query average concurrent: `avg_over_time(cdn_viewers{stream="...", window="2h"}[1h])`
+- Unique viewers from the latest processed file/flush (gauge)
+- Labels: `stream`
+- Value is recalculated from the current processed batch, not a rolling session window
+- Query current unique viewers: `cdn_viewers{stream="..."}`
+- Query peak during broadcast: `max_over_time(cdn_viewers{stream="..."}[3h])`
+- Query average concurrent: `avg_over_time(cdn_viewers{stream="..."}[1h])`
 
 **`cdn_viewers_by_device`**
-- Current unique viewers by device type in rolling window (gauge)
-- Labels: `stream`, `device_type`, `window`
-- Query by platform: `cdn_viewers_by_device{stream="...", device_type="roku", window="2h"}`
-- Baron vs OTT: `sum by (device_type) (cdn_viewers_by_device{stream="...", window="2h"})`
+- Unique viewers by device type from the latest processed file/flush (gauge)
+- Labels: `stream`, `device_type`
+- Query by platform: `cdn_viewers_by_device{stream="...", device_type="roku"}`
+- Baron vs OTT: `sum by (device_type) (cdn_viewers_by_device{stream="..."})`
 
 **`cdn_viewers_by_country`**
-- Current unique viewers by country in rolling window (gauge)
-- Labels: `stream`, `country`, `window`
+- Unique viewers by country from the latest processed file/flush (gauge)
+- Labels: `stream`, `country`
 - Requires GeoIP database (see setup below)
-- Query top countries: `topk(10, cdn_viewers_by_country{stream="...", window="2h"})`
-- Query specific country: `cdn_viewers_by_country{stream="...", country="US", window="2h"}`
+- Query top countries: `topk(10, cdn_viewers_by_country{stream="..."})`
+- Query specific country: `cdn_viewers_by_country{stream="...", country="US"}`
 
 **`cdn_viewers_by_region`**
-- Current unique viewers by state/region in rolling window (gauge)
+- Unique viewers by state/region from the latest processed file/flush (gauge)
+- Labels: `stream`, `country`, `region`
+- Requires GeoIP database (see setup below)
+- Query top regions: `topk(10, cdn_viewers_by_region{stream="..."})`
+- Query US states: `cdn_viewers_by_region{stream="...", country="US"}`
+
+**`cdn_viewers_unique`**
+- Unique viewers from rolling session state for configured window (default: 1h) (gauge)
+- Labels: `stream`, `window`
+- Query 1h unique viewers: `cdn_viewers_unique{stream="...", window="1h"}`
+
+**`cdn_viewers_unique_by_device`**
+- Rolling unique viewers by device for configured window (default: 1h) (gauge)
+- Labels: `stream`, `device_type`, `window`
+- Query platform mix: `sum by (device_type) (cdn_viewers_unique_by_device{stream="...", window="1h"})`
+
+**`cdn_viewers_unique_by_country`**
+- Rolling unique viewers by country for configured window (default: 1h) (gauge)
+- Labels: `stream`, `country`, `window`
+- Query top countries: `topk(10, cdn_viewers_unique_by_country{stream="...", window="1h"})`
+
+**`cdn_viewers_unique_by_region`**
+- Rolling unique viewers by state/region for configured window (default: 1h) (gauge)
 - Labels: `stream`, `country`, `region`, `window`
 - Requires GeoIP database (see setup below)
-- Query top regions: `topk(10, cdn_viewers_by_region{stream="...", window="2h"})`
-- Query US states: `cdn_viewers_by_region{stream="...", country="US", window="2h"}`
+- Query US states: `cdn_viewers_unique_by_region{stream="...", country="US", window="1h"}`
 
 **`cdn_time_to_first_byte_ms`**
 - Average time to first byte in milliseconds (gauge)
@@ -293,14 +314,21 @@ docker run --rm --name cdn77-exporter \
 - `PROMETHEUS_PASSWORD` - Prometheus basic auth password (optional)
 - `POLL_INTERVAL` - Polling interval in seconds (default: 60)
 - `LOOKBACK_HOURS` - How far back to check for files (default: 2)
-- `SESSION_WINDOW_SECONDS` - Rolling window for active viewer tracking (default: 7200 = 2 hours)
+- `SESSION_WINDOW_SECONDS` - Session retention horizon used for unique-window calculations (default: 7200 = 2 hours)
+- `UNIQUE_VIEWERS_WINDOW_SECONDS` - Window used for `cdn_viewers_unique*` metrics (default: 3600 = 1 hour)
 - `GEOIP_DB_PATH` - Path to MaxMind GeoLite2-City.mmdb database (optional, for geographic metrics)
 - `PROMETHEUS_RETRY_ATTEMPTS` - Retries for failed remote-write pushes in writer thread (default: 5)
 - `PROMETHEUS_RETRY_BASE_DELAY_SECONDS` - Initial retry backoff delay (default: 1.0)
 - `PROMETHEUS_RETRY_MAX_DELAY_SECONDS` - Max retry backoff delay cap (default: 30.0)
+- `STARTUP_OFFSET_MS` - Millisecond offset added to minute-aligned samples (default: 0)
 - `METRIC_PREFIX` - Prefix for all emitted metric names (default: `cdn_`, e.g. `cdn_users_total`)
 - `UNMATCHED_DEVICE_LOGGING` - Enable end-of-poll logging of user agents classified as `other` (default: `true`)
 - `UNMATCHED_DEVICE_MAX_TRACKED` - Maximum unique unmatched user agents tracked in memory (default: `5000`)
+
+### Future: Additional unique windows
+
+Current behavior emits a single unique window via `UNIQUE_VIEWERS_WINDOW_SECONDS` (default `1h`).
+To support multiple windows later (for example `1h`, `2h`, `4h`, `24h`), emit additional `cdn_viewers_unique*` snapshots with different `window` label values from the same session table, and set `SESSION_WINDOW_SECONDS` to at least the largest target window.
 
 ## How It Works
 
@@ -311,9 +339,9 @@ docker run --rm --name cdn77-exporter \
 5. **Flush After Each File**: Events immediately flushed and aggregated by minute
 6. **Multi-Metric Generation**: Single event stream generates multiple series.
 7. **Timestamp Offset Strategy**: Prevents duplicate timestamp errors:
-   - Random startup offset: 0-999ms (logged at startup)
+  - Startup offset: `STARTUP_OFFSET_MS` (default `0`, so first sample lands on exact minute boundary)
    - Batch increment: +100ms per batch for same minute
-   - Example: 04:27:00.437, 04:27:00.537, 04:27:00.637 (all within 1 second of actual time)
+  - Example: 04:27:00.000, 04:27:00.100, 04:27:00.200 (same source minute, deduplicated by ms offset)
 8. **Label Dimensions**: All metrics tagged with stream, cdn_id, cache_status, pop (location)
 9. **Push to Prometheus**: Batched push via remote write API (protobuf + snappy compression)
 10. **Delete & Repeat**: Removes processed file from S3, waits for next poll
@@ -332,7 +360,7 @@ Aggregate by Minute+Labels → Apply Offset → Push to Prometheus → Delete fr
 **Overlapping File Handling:**
 - Files contain overlapping timestamps (~30s each, consecutive files overlap by seconds)
 - Batch offset system allows multiple flushes per minute without duplicates
-- Each flush gets unique timestamp via millisecond offsets
+- Each flush keeps minute boundary timestamp semantics and gets unique millisecond offsets
 - Prometheus automatically aggregates across batches in range queries
 
 ## Performance

@@ -16,7 +16,6 @@ import json
 import logging
 import os
 import queue
-import random
 import re
 import signal
 import sys
@@ -74,6 +73,33 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _duration_label_from_seconds(seconds: int) -> str:
+    """Format duration in seconds as compact human-readable label."""
+    if seconds <= 0:
+        return "0s"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+def floor_to_minute(dt: datetime) -> datetime:
+    """Round datetime down to minute boundary in UTC."""
+    return dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
+
+
+def minute_timestamp_ms(dt: datetime, batch_offset_ms: int = 0) -> int:
+    """Convert datetime to minute-aligned Unix timestamp in milliseconds."""
+    return int(floor_to_minute(dt).timestamp() * 1000) + batch_offset_ms
+
+
+def minute_key_to_datetime(minute_key: str) -> datetime:
+    """Parse exporter minute key into UTC datetime."""
+    dt = datetime.strptime(minute_key, '%d/%b/%Y %H:%M')
+    return dt.replace(tzinfo=timezone.utc)
 
 
 UNMATCHED_DEVICE_LOGGING = _env_bool('UNMATCHED_DEVICE_LOGGING', True)
@@ -302,7 +328,6 @@ class SessionTracker:
             geoip_db_path: Path to MaxMind GeoIP2 database file (optional)
         """
         self.window = timedelta(seconds=window_seconds)
-        self.window_label = f"{window_seconds//3600}h" if window_seconds >= 3600 else f"{window_seconds//60}m"
         
         # Store: {stream_id: {ip_address: SessionInfo}}
         self.sessions: Dict[str, Dict[str, SessionInfo]] = defaultdict(dict)
@@ -437,7 +462,7 @@ class SessionTracker:
                 if not self.sessions[stream_id]:
                     del self.sessions[stream_id]
     
-    def get_gauge_metrics(self, batch_offset_ms: int = 0) -> List[Dict]:
+    def get_gauge_metrics(self, reference_time: Optional[datetime] = None, batch_offset_ms: int = 0) -> List[Dict]:
         """
         Generate gauge metrics for current session state.
         
@@ -448,12 +473,13 @@ class SessionTracker:
         - cdn77_viewers_by_region: Unique IPs per stream per region
         
         Args:
+            reference_time: Reference time for timestamp/cutoff calculations (defaults to now)
             batch_offset_ms: Millisecond offset to prevent duplicate timestamps
         """
         with self._lock:
             metrics = []
-            now = datetime.now(timezone.utc)
-            timestamp_ms = int(now.timestamp() * 1000) + batch_offset_ms
+            reference_dt = floor_to_minute(reference_time or datetime.now(timezone.utc))
+            timestamp_ms = int(reference_dt.timestamp() * 1000) + batch_offset_ms
             skipped_unknown_region_series = 0
             
             for stream_id, sessions in self.sessions.items():
@@ -467,7 +493,6 @@ class SessionTracker:
                     'timestamp_ms': timestamp_ms,
                     'labels': {
                         'stream': stream_id,
-                        'window': self.window_label
                     }
                 })
                 
@@ -490,7 +515,6 @@ class SessionTracker:
                         'labels': {
                             'stream': stream_id,
                             'device_type': device_type,
-                            'window': self.window_label
                         }
                     })
                 
@@ -503,7 +527,6 @@ class SessionTracker:
                         'labels': {
                             'stream': stream_id,
                             'country': country,
-                            'window': self.window_label
                         }
                     })
                 
@@ -519,7 +542,6 @@ class SessionTracker:
                                 'stream': stream_id,
                                 'country': country,
                                 'region': region,
-                                'window': self.window_label
                             }
                         })
                     else:
@@ -532,6 +554,102 @@ class SessionTracker:
                 )
             
             return metrics
+
+    def get_unique_metrics(
+        self,
+        window_seconds: int,
+        window_label: str,
+        reference_time: Optional[datetime] = None,
+        batch_offset_ms: int = 0,
+    ) -> List[Dict]:
+        """Generate unique-viewer gauges constrained to a specific lookback window."""
+        with self._lock:
+            metrics = []
+            reference_dt = floor_to_minute(reference_time or datetime.now(timezone.utc))
+            cutoff = reference_dt - timedelta(seconds=window_seconds)
+            timestamp_ms = int(reference_dt.timestamp() * 1000) + batch_offset_ms
+            skipped_unknown_region_series = 0
+
+            for stream_id, sessions in self.sessions.items():
+                if not sessions:
+                    continue
+
+                active_sessions = {
+                    ip: session
+                    for ip, session in sessions.items()
+                    if session.last_seen >= cutoff
+                }
+
+                if not active_sessions:
+                    continue
+
+                metrics.append({
+                    'metric_name': metric_name('viewers_unique'),
+                    'value': float(len(active_sessions)),
+                    'timestamp_ms': timestamp_ms,
+                    'labels': {
+                        'stream': stream_id,
+                        'window': window_label,
+                    }
+                })
+
+                by_device = defaultdict(set)
+                by_country = defaultdict(set)
+                by_region = defaultdict(set)
+
+                for ip, session in active_sessions.items():
+                    by_device[session.device_type].add(ip)
+                    by_country[session.country].add(ip)
+                    by_region[f"{session.country}_{session.region}"].add(ip)
+
+                for device_type, ips in by_device.items():
+                    metrics.append({
+                        'metric_name': metric_name('viewers_unique_by_device'),
+                        'value': float(len(ips)),
+                        'timestamp_ms': timestamp_ms,
+                        'labels': {
+                            'stream': stream_id,
+                            'device_type': device_type,
+                            'window': window_label,
+                        }
+                    })
+
+                for country, ips in by_country.items():
+                    metrics.append({
+                        'metric_name': metric_name('viewers_unique_by_country'),
+                        'value': float(len(ips)),
+                        'timestamp_ms': timestamp_ms,
+                        'labels': {
+                            'stream': stream_id,
+                            'country': country,
+                            'window': window_label,
+                        }
+                    })
+
+                for region_key, ips in by_region.items():
+                    country, region = region_key.split('_', 1)
+                    if region != "Unknown":
+                        metrics.append({
+                            'metric_name': metric_name('viewers_unique_by_region'),
+                            'value': float(len(ips)),
+                            'timestamp_ms': timestamp_ms,
+                            'labels': {
+                                'stream': stream_id,
+                                'country': country,
+                                'region': region,
+                                'window': window_label,
+                            }
+                        })
+                    else:
+                        skipped_unknown_region_series += len(ips)
+
+            if skipped_unknown_region_series > 0:
+                logger.info(
+                    "Skipped viewers_unique_by_region emission for %d unique sessions with unknown region",
+                    skipped_unknown_region_series,
+                )
+
+            return metrics
     
     def get_stats(self) -> Dict[str, int]:
         """Get statistics about current sessions"""
@@ -542,6 +660,69 @@ class SessionTracker:
                 'streams': total_streams,
                 'total_sessions': total_sessions
             }
+
+
+def build_file_viewer_metrics(
+    events: List[Event],
+    timestamp_ms: int,
+    geo_lookup: Callable[[str], Tuple[str, str]],
+) -> List[Dict]:
+    """Build viewer metrics from the current flushed event set (file-specific view)."""
+    if not events:
+        return []
+
+    by_stream_ips: Dict[str, Set[str]] = defaultdict(set)
+    by_stream_device: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+    by_stream_country: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+    by_stream_region: Dict[Tuple[str, str, str], Set[str]] = defaultdict(set)
+
+    for event in events:
+        stream = event.stream_id
+        ip = event.client_ip
+
+        by_stream_ips[stream].add(ip)
+        by_stream_device[(stream, event.device_type)].add(ip)
+
+        country = event.client_country if event.client_country else "XX"
+        by_stream_country[(stream, country)].add(ip)
+
+        lookup_country, region = geo_lookup(ip)
+        if not country and lookup_country:
+            country = lookup_country
+        if region and region != "Unknown":
+            by_stream_region[(stream, country, region)].add(ip)
+
+    metrics: List[Dict] = []
+
+    for stream, ips in by_stream_ips.items():
+        metrics.append({
+            'metric': f'{metric_name("viewers")}{{stream="{stream}"}}',
+            'value': float(len(ips)),
+            'timestamp': timestamp_ms,
+        })
+
+    for (stream, device_type), ips in by_stream_device.items():
+        metrics.append({
+            'metric': f'{metric_name("viewers_by_device")}{{stream="{stream}",device_type="{device_type}"}}',
+            'value': float(len(ips)),
+            'timestamp': timestamp_ms,
+        })
+
+    for (stream, country), ips in by_stream_country.items():
+        metrics.append({
+            'metric': f'{metric_name("viewers_by_country")}{{stream="{stream}",country="{country}"}}',
+            'value': float(len(ips)),
+            'timestamp': timestamp_ms,
+        })
+
+    for (stream, country, region), ips in by_stream_region.items():
+        metrics.append({
+            'metric': f'{metric_name("viewers_by_region")}{{stream="{stream}",country="{country}",region="{region}"}}',
+            'value': float(len(ips)),
+            'timestamp': timestamp_ms,
+        })
+
+    return metrics
 
 
 # ============================================================================
@@ -1160,8 +1341,7 @@ class PrometheusExporter:
             
             # Parse datetime from minute_key and add batch offset
             try:
-                dt = datetime.strptime(minute_key, '%d/%b/%Y %H:%M')
-                dt = dt.replace(tzinfo=timezone.utc)
+                dt = minute_key_to_datetime(minute_key)
                 # Add batch offset in milliseconds to prevent duplicate timestamps
                 timestamp_ms = int(dt.timestamp() * 1000) + batch_offset_ms
             except Exception as e:
@@ -1251,9 +1431,13 @@ class PrometheusExporter:
                 
                 # Parse metric name and labels
                 metric_str = metric_data['metric']
-                brace_idx = metric_str.index('{')
-                metric_name = metric_str[:brace_idx]
-                labels_str = metric_str[brace_idx+1:-1]
+                if '{' in metric_str and metric_str.endswith('}'):
+                    brace_idx = metric_str.index('{')
+                    metric_name = metric_str[:brace_idx]
+                    labels_str = metric_str[brace_idx+1:-1]
+                else:
+                    metric_name = metric_str
+                    labels_str = ""
                 
                 # Add __name__ label
                 label = ts.labels.add()
@@ -1261,13 +1445,16 @@ class PrometheusExporter:
                 label.value = metric_name
                 
                 # Add other labels
-                for label_pair in labels_str.split(','):
-                    eq_idx = label_pair.index('=')
-                    key = label_pair[:eq_idx]
-                    value = label_pair[eq_idx+2:-1]
-                    label = ts.labels.add()
-                    label.name = key
-                    label.value = value
+                if labels_str:
+                    for label_pair in labels_str.split(','):
+                        if not label_pair:
+                            continue
+                        eq_idx = label_pair.index('=')
+                        key = label_pair[:eq_idx]
+                        value = label_pair[eq_idx+2:-1]
+                        label = ts.labels.add()
+                        label.name = key
+                        label.value = value
                 
                 # Add sample
                 sample = ts.samples.add()
@@ -1429,9 +1616,12 @@ class S3Importer:
         # Key: minute_key, Value: (flush_count, last_flush_time)
         self.flush_count_per_minute: Dict[str, tuple[int, datetime]] = {}
         
-        # Random startup offset (0-999ms) to prevent collisions across restarts/instances
-        self.startup_offset_ms = random.randint(0, 999)
-        logger.info(f"Generated startup offset: {self.startup_offset_ms}ms")
+        # Startup offset for first sample placement within the minute (default exact minute)
+        self.startup_offset_ms = _env_int('STARTUP_OFFSET_MS', 0)
+        if self.startup_offset_ms < 0:
+            logger.warning(f"Invalid STARTUP_OFFSET_MS={self.startup_offset_ms}; using 0")
+            self.startup_offset_ms = 0
+        logger.info(f"Using startup offset: {self.startup_offset_ms}ms")
         
         # Track dropped events (for statistics)
         self.dropped_events = 0
@@ -1441,8 +1631,26 @@ class S3Importer:
         self.prometheus_retry_base_delay_seconds = float(os.getenv('PROMETHEUS_RETRY_BASE_DELAY_SECONDS', '1.0'))
         self.prometheus_retry_max_delay_seconds = float(os.getenv('PROMETHEUS_RETRY_MAX_DELAY_SECONDS', '30.0'))
 
-        # Rolling-session gauges (viewers/viewers_by_*)
-        self.viewers_window_seconds = _env_int('SESSION_WINDOW_SECONDS', 7200)
+        # Rolling-session retention and unique-viewer window
+        self.unique_viewers_window_seconds = _env_int('UNIQUE_VIEWERS_WINDOW_SECONDS', 3600)
+        if self.unique_viewers_window_seconds <= 0:
+            logger.warning(
+                f"Invalid UNIQUE_VIEWERS_WINDOW_SECONDS={self.unique_viewers_window_seconds}; using default 3600"
+            )
+            self.unique_viewers_window_seconds = 3600
+        self.unique_viewers_window_label = _duration_label_from_seconds(self.unique_viewers_window_seconds)
+
+        configured_session_window_seconds = _env_int('SESSION_WINDOW_SECONDS', 7200)
+        self.viewers_window_seconds = max(configured_session_window_seconds, self.unique_viewers_window_seconds)
+        if configured_session_window_seconds < self.unique_viewers_window_seconds:
+            logger.warning(
+                "SESSION_WINDOW_SECONDS (%s) is less than UNIQUE_VIEWERS_WINDOW_SECONDS (%s); "
+                "expanding session retention to %s",
+                configured_session_window_seconds,
+                self.unique_viewers_window_seconds,
+                self.viewers_window_seconds,
+            )
+
         self.geoip_db_path = os.getenv('GEOIP_DB_PATH')
         self.session_tracker = SessionTracker(
             window_seconds=self.viewers_window_seconds,
@@ -1459,14 +1667,18 @@ class S3Importer:
         )
         self.writer_thread.start()
         self.last_flush_time = datetime.now(timezone.utc)
+        self.last_processed_event_time: Optional[datetime] = None
     
     def _flush_events(self, events: List[Event], source: str):
         """Aggregate events into metrics and queue for Prometheus with batch offsets"""
         if not events:
             return
 
-        # Update rolling session state for gauge metrics emitted once per poll
+        # Keep rolling session state current for unique-window gauges
         self.session_tracker.update(events)
+        max_event_time = max(event.timestamp for event in events)
+        if self.last_processed_event_time is None or max_event_time > self.last_processed_event_time:
+            self.last_processed_event_time = max_event_time
         
         now = datetime.now(timezone.utc)
         
@@ -1489,6 +1701,7 @@ class S3Importer:
         
         # Flush each minute separately with batch offset
         total_metrics = 0
+        file_viewer_metrics: List[Dict] = []
         for minute_key in sorted(events_by_minute.keys()):
             minute_events = events_by_minute[minute_key]
             
@@ -1527,6 +1740,20 @@ class S3Importer:
                     total_metrics += len(metrics)
                 except queue.Full:
                     logger.error(f"Queue full! Dropping {len(metrics)} metrics for minute {minute_key}")
+
+            minute_viewer_metrics = build_file_viewer_metrics(
+                minute_events,
+                timestamp_ms=minute_timestamp_ms(minute_key_to_datetime(minute_key), batch_offset_ms),
+                geo_lookup=self.session_tracker.lookup_geo,
+            )
+            file_viewer_metrics.extend(minute_viewer_metrics)
+
+        # Emit per-file viewer metrics with minute-aligned timestamps
+        if file_viewer_metrics:
+            try:
+                self.write_queue.put((file_viewer_metrics, f"{source}-Viewers"), timeout=5.0)
+            except queue.Full:
+                logger.error(f"Queue full! Dropping {len(file_viewer_metrics)} file viewer metrics")
     
     def _check_and_flush_buffer(self):
         """Flush all buffered events immediately (batch offsets prevent duplicates)"""
@@ -1546,9 +1773,9 @@ class S3Importer:
         started_at = time.monotonic()
         lines_processed = 0
 
-        def emit_file_processing_metrics(success: bool, processed_lines: int):
+        def emit_file_processing_metrics(success: bool, processed_lines: int, reference_time: Optional[datetime] = None):
             duration_seconds = time.monotonic() - started_at
-            timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            timestamp_ms = minute_timestamp_ms(reference_time or datetime.now(timezone.utc))
             result_label = "success" if success else "failure"
             metrics = [
                 {
@@ -1621,7 +1848,8 @@ class S3Importer:
             # Delete from S3 after successful processing
             self.s3_client.delete_object(s3_key)
 
-            emit_file_processing_metrics(True, lines_processed)
+            reference_time = max(e.timestamp for e in events) if events else datetime.now(timezone.utc)
+            emit_file_processing_metrics(True, lines_processed, reference_time=reference_time)
             
             return True
             
@@ -1681,16 +1909,22 @@ class S3Importer:
         # Final flush check after processing all files
         self._check_and_flush_buffer()
 
-        # Emit rolling-window gauge snapshot once per poll (includes viewers_by_region)
-        self.session_tracker.expire_old(datetime.now(timezone.utc))
-        session_gauge_data = self.session_tracker.get_gauge_metrics(batch_offset_ms=self.startup_offset_ms)
-        session_gauge_metrics = self.exporter.build_gauge_metrics(session_gauge_data)
-        if session_gauge_metrics:
+        # Emit configurable unique-window session snapshot (default: 1h)
+        unique_reference_time = self.last_processed_event_time or datetime.now(timezone.utc)
+        self.session_tracker.expire_old(unique_reference_time)
+        unique_gauge_data = self.session_tracker.get_unique_metrics(
+            window_seconds=self.unique_viewers_window_seconds,
+            window_label=self.unique_viewers_window_label,
+            reference_time=unique_reference_time,
+            batch_offset_ms=self.startup_offset_ms,
+        )
+        unique_gauge_metrics = self.exporter.build_gauge_metrics(unique_gauge_data)
+        if unique_gauge_metrics:
             try:
-                self.write_queue.put((session_gauge_metrics, "SessionGauges"), timeout=5.0)
+                self.write_queue.put((unique_gauge_metrics, "UniqueSessionGauges"), timeout=5.0)
             except queue.Full:
-                logger.error(f"Queue full! Dropping {len(session_gauge_metrics)} rolling session gauge metrics")
-        
+                logger.error(f"Queue full! Dropping {len(unique_gauge_metrics)} unique session gauge metrics")
+
         # Wait for queue to empty
         logger.info("Waiting for writer thread to finish...")
         self.write_queue.join()
@@ -1709,7 +1943,7 @@ class S3Importer:
             undefined_metric = {
                 'metric': f'{metric_name("viewer_undefined_devices_total")}{{}}',
                 'value': float(total_undefined_devices),
-                'timestamp': int(datetime.now(timezone.utc).timestamp() * 1000),
+                'timestamp': minute_timestamp_ms(unique_reference_time),
             }
             try:
                 self.write_queue.put(([undefined_metric], "UndefinedDevices"), timeout=1.0)
