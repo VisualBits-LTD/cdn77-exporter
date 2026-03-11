@@ -16,102 +16,102 @@ Copilot context for this repository: [`.github/copilot-instructions.md`](.github
 ## Metrics Exported
 
 Metric names are prefixed by `METRIC_PREFIX` (default: `cdn_`).
-Examples below use the legacy `cdn77_` prefix for compatibility with existing dashboards.
+Examples below use the `cdn_` prefix.
 
 The exporter generates 11 metrics with rich dimensional labels (stream, cdn_id, cache_status, pop, response_status, device_type, country, region):
 
 ### Counters (use with `rate()` or `increase()`)
 
-**`cdn77_transfer_bytes_total`**
+**`cdn_transfer_bytes_total`**
 - Total bytes transferred (counter)
 - Labels: `stream`, `cdn_id`, `cache_status`, `pop`
-- Query bandwidth (bits/sec): `sum(rate(cdn77_transfer_bytes_total{stream="..."}[5m])) * 8`
-- Query total bytes in 5 minutes: `sum(increase(cdn77_transfer_bytes_total{stream="..."}[5m]))`
-- Query by location: `sum by (pop) (rate(cdn77_transfer_bytes_total{stream="..."}[5m]))`
+- Query bandwidth (bits/sec): `sum(rate(cdn_transfer_bytes_total{stream="..."}[5m])) * 8`
+- Query total bytes in 5 minutes: `sum(increase(cdn_transfer_bytes_total{stream="..."}[5m]))`
+- Query by location: `sum by (pop) (rate(cdn_transfer_bytes_total{stream="..."}[5m]))`
 
-**`cdn77_requests_total`**
+**`cdn_requests_total`**
 - Total number of requests (counter)
 - Labels: `stream`, `cdn_id`, `cache_status`, `pop`
-- Query requests/sec: `sum(rate(cdn77_requests_total{stream="..."}[5m]))`
-- Query total requests: `sum(increase(cdn77_requests_total{stream="..."}[1h]))`
-- Query by cache status: `sum by (cache_status) (rate(cdn77_requests_total{stream="..."}[5m]))`
+- Query requests/sec: `sum(rate(cdn_requests_total{stream="..."}[5m]))`
+- Query total requests: `sum(increase(cdn_requests_total{stream="..."}[1h]))`
+- Query by cache status: `sum by (cache_status) (rate(cdn_requests_total{stream="..."}[5m]))`
 
-**`cdn77_responses_total`**
+**`cdn_responses_total`**
 - Requests by HTTP status code (counter)
 - Labels: `stream`, `cdn_id`, `cache_status`, `pop`, `response_status`
-- Query 4xx error rate: `sum(rate(cdn77_responses_total{stream="...", response_status=~"4.."}[5m]))`
-- Query success rate: `sum(rate(cdn77_responses_total{stream="...", response_status="200"}[5m]))`
+- Query 4xx error rate: `sum(rate(cdn_responses_total{stream="...", response_status=~"4.."}[5m]))`
+- Query success rate: `sum(rate(cdn_responses_total{stream="...", response_status="200"}[5m]))`
 
-**`cdn77_users_total`**
+**`cdn_users_total`**
 - Count of unique IP addresses per stream (counter)
 - Labels: `stream`
-- Query unique users per stream: `cdn77_users_total{stream="..."}`
-- Query total unique users across all streams: `sum(cdn77_users_total)`
-- Query unique users rate: `rate(cdn77_users_total{stream="..."}[5m])`
+- Query unique users per stream: `cdn_users_total{stream="..."}`
+- Query total unique users across all streams: `sum(cdn_users_total)`
+- Query unique users rate: `rate(cdn_users_total{stream="..."}[5m])`
 
-**`cdn77_users_by_device_total`**
+**`cdn_users_by_device_total`**
 - Count of unique IP addresses per stream by device type (counter)
 - Labels: `stream`, `device_type`
 - Device types: `android`, `ios`, `apple_tv`, `roku`, `firestick`, `web`, `bots`, `streamology`, `other`
-- Query mobile vs OTT: `cdn77_users_by_device_total{stream="...", device_type=~"android|ios|apple_tv|roku|firestick"}`
-- Query by platform: `sum by (device_type) (cdn77_users_by_device_total{stream="..."})`
-- Compare platforms: `cdn77_users_by_device_total{stream="...", device_type="roku"}` vs `device_type="apple_tv"`
+- Query mobile vs OTT: `cdn_users_by_device_total{stream="...", device_type=~"android|ios|apple_tv|roku|firestick"}`
+- Query by platform: `sum by (device_type) (cdn_users_by_device_total{stream="..."})`
+- Compare platforms: `cdn_users_by_device_total{stream="...", device_type="roku"}` vs `device_type="apple_tv"`
 
-**`cdn77_users_by_country_total`**
+**`cdn_users_by_country_total`**
 - Count of unique IP addresses per stream by country (counter)
 - Labels: `stream`, `country`
 - Country from CDN77 logs (ISO 3166-1 alpha-2)
-- Query unique users per country: `cdn77_users_by_country_total{stream="...", country="US"}`
-- Query top countries: `topk(10, cdn77_users_by_country_total{stream="..."})`
-- Query growth rate: `rate(cdn77_users_by_country_total{stream="...", country="US"}[5m])`
+- Query unique users per country: `cdn_users_by_country_total{stream="...", country="US"}`
+- Query top countries: `topk(10, cdn_users_by_country_total{stream="..."})`
+- Query growth rate: `rate(cdn_users_by_country_total{stream="...", country="US"}[5m])`
 
 ### Gauges (use with `max_over_time()` or direct value)
 
-**`cdn77_viewers`**
+**`cdn_viewers`**
 - Current unique viewers in rolling time window (gauge)
 - Labels: `stream`, `window`
 - Tracks unique IPs over 2-hour rolling window (handles retroactive data)
-- Query current unique viewers: `cdn77_viewers{stream="...", window="2h"}`
-- Query peak during broadcast: `max_over_time(cdn77_viewers{stream="...", window="2h"}[3h])`
-- Query average concurrent: `avg_over_time(cdn77_viewers{stream="...", window="2h"}[1h])`
+- Query current unique viewers: `cdn_viewers{stream="...", window="2h"}`
+- Query peak during broadcast: `max_over_time(cdn_viewers{stream="...", window="2h"}[3h])`
+- Query average concurrent: `avg_over_time(cdn_viewers{stream="...", window="2h"}[1h])`
 
-**`cdn77_viewers_by_device`**
+**`cdn_viewers_by_device`**
 - Current unique viewers by device type in rolling window (gauge)
 - Labels: `stream`, `device_type`, `window`
-- Query by platform: `cdn77_viewers_by_device{stream="...", device_type="roku", window="2h"}`
-- Baron vs OTT: `sum by (device_type) (cdn77_viewers_by_device{stream="...", window="2h"})`
+- Query by platform: `cdn_viewers_by_device{stream="...", device_type="roku", window="2h"}`
+- Baron vs OTT: `sum by (device_type) (cdn_viewers_by_device{stream="...", window="2h"})`
 
-**`cdn77_viewers_by_country`**
+**`cdn_viewers_by_country`**
 - Current unique viewers by country in rolling window (gauge)
 - Labels: `stream`, `country`, `window`
 - Requires GeoIP database (see setup below)
-- Query top countries: `topk(10, cdn77_viewers_by_country{stream="...", window="2h"})`
-- Query specific country: `cdn77_viewers_by_country{stream="...", country="US", window="2h"}`
+- Query top countries: `topk(10, cdn_viewers_by_country{stream="...", window="2h"})`
+- Query specific country: `cdn_viewers_by_country{stream="...", country="US", window="2h"}`
 
-**`cdn77_viewers_by_region`**
+**`cdn_viewers_by_region`**
 - Current unique viewers by state/region in rolling window (gauge)
 - Labels: `stream`, `country`, `region`, `window`
 - Requires GeoIP database (see setup below)
-- Query top regions: `topk(10, cdn77_viewers_by_region{stream="...", window="2h"})`
-- Query US states: `cdn77_viewers_by_region{stream="...", country="US", window="2h"}`
+- Query top regions: `topk(10, cdn_viewers_by_region{stream="...", window="2h"})`
+- Query US states: `cdn_viewers_by_region{stream="...", country="US", window="2h"}`
 
-**`cdn77_time_to_first_byte_ms`**
+**`cdn_time_to_first_byte_ms`**
 - Average time to first byte in milliseconds (gauge)
 - Labels: `stream`, `cdn_id`, `cache_status`, `pop`
-- Query average TTFB: `avg_over_time(cdn77_time_to_first_byte_ms{stream="..."}[5m])`
-- Query by location: `avg by (pop) (avg_over_time(cdn77_time_to_first_byte_ms{stream="..."}[5m]))`
+- Query average TTFB: `avg_over_time(cdn_time_to_first_byte_ms{stream="..."}[5m])`
+- Query by location: `avg by (pop) (avg_over_time(cdn_time_to_first_byte_ms{stream="..."}[5m]))`
 
-**`cdn77_file_process_time_seconds`**
+**`cdn_file_process_time_seconds`**
 - Time to download, decompress, parse, and delete one log file (gauge)
 - Labels: `result` (`success` or `failure`)
-- Query average processing time: `avg_over_time(cdn77_file_process_time_seconds{result="success"}[5m])`
-- Query failure processing time: `avg_over_time(cdn77_file_process_time_seconds{result="failure"}[15m])`
+- Query average processing time: `avg_over_time(cdn_file_process_time_seconds{result="success"}[5m])`
+- Query failure processing time: `avg_over_time(cdn_file_process_time_seconds{result="failure"}[15m])`
 
-**`cdn77_file_lines_processed_total`**
+**`cdn_file_lines_processed_total`**
 - Number of NDJSON lines processed per file (gauge-like per-file sample)
 - Labels: `result` (`success` or `failure`)
-- Query average lines/file: `avg_over_time(cdn77_file_lines_processed_total{result="success"}[5m])`
-- Query processing throughput estimate: `sum_over_time(cdn77_file_lines_processed_total{result="success"}[5m]) / 300`
+- Query average lines/file: `avg_over_time(cdn_file_lines_processed_total{result="success"}[5m])`
+- Query processing throughput estimate: `sum_over_time(cdn_file_lines_processed_total{result="success"}[5m]) / 300`
 
 **`cdn_viewer_undefined_devices_total`**
 - Total unmatched device user-agent events observed in a poll cycle (gauge-like per-poll sample)
@@ -126,7 +126,7 @@ All metrics include these labels for filtering and grouping:
 - `cdn_id` - CDN77 resource ID
 - `cache_status` - HIT, MISS, EXPIRED, etc.
 - `pop` - Edge location (e.g., "losangelesUSCA", "frankfurtDEHE")
-- `response_status` - HTTP status code (only on `cdn77_responses_total`)
+- `response_status` - HTTP status code (only on `cdn_responses_total`)
 
 ## Log Format
 
@@ -203,7 +203,7 @@ Files contain approximately 30 seconds of log data, delivered with minimal laten
 
 ## GeoIP Setup (Optional)
 
-For geographic metrics (`cdn77_viewers_by_country` and `cdn77_viewers_by_region`), download the MaxMind GeoLite2 database:
+For geographic metrics (`cdn_viewers_by_country` and `cdn_viewers_by_region`), download the MaxMind GeoLite2 database:
 
 1. **Sign up for free MaxMind account:** https://dev.maxmind.com/geoip/geolite2-free-geolocation-data
 2. **Download GeoLite2-City.mmdb** (~70MB)
@@ -275,7 +275,7 @@ docker run --rm --name cdn77-exporter \
   -e S3_PREFIX=real-time-logs/all-logs \
   -e S3_ACCESS_KEY=xxx \
   -e S3_SECRET_KEY=xxx \
-  -e METRIC_PREFIX=cdn77_ \
+  -e METRIC_PREFIX=cdn_ \
   -e PROMETHEUS_URL=https://prometheus.streamology.tv/api/v1/write \
   cdn77-exporter:prod
 ```

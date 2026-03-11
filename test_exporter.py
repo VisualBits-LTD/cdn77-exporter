@@ -1017,6 +1017,211 @@ class TestSessionTracker:
         total_metric = [m for m in metrics if m['metric_name'] == 'cdn77_viewers'][0]
         assert total_metric['value'] == 2.0
 
+    def test_region_metrics_use_geoip_when_region_missing(self):
+        """Region gauges should use GeoIP lookup when event only has country code."""
+        tracker = SessionTracker(window_seconds=300)
+        tracker.geoip_reader = object()  # Enable GeoIP path for lookup
+        tracker.lookup_geo = lambda ip: ("US", "California")
+
+        event = Event(
+            timestamp=datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc),
+            stream_id="abcd1234567890abcdef1234567890ab",
+            client_ip="10.0.0.1",
+            device_type="web",
+            resource_id=123,
+            cache_status="HIT",
+            response_bytes=1000,
+            time_to_first_byte_ms=100,
+            tcp_rtt_us=50000,
+            request_time_ms=150,
+            response_status=200,
+            client_country="US",
+            location_id="losangelesUSCA",
+            raw_data={},
+        )
+
+        tracker.update([event])
+        metrics = tracker.get_gauge_metrics()
+
+        region_metrics = [m for m in metrics if m['metric_name'] == 'cdn77_viewers_by_region']
+        assert len(region_metrics) == 1
+        assert region_metrics[0]['labels']['country'] == 'US'
+        assert region_metrics[0]['labels']['region'] == 'California'
+        assert region_metrics[0]['value'] == 1.0
+
+    def test_region_metrics_skip_unknown_region(self):
+        """Region gauges should not emit a series when region is unknown."""
+        tracker = SessionTracker(window_seconds=300)
+
+        event = Event(
+            timestamp=datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc),
+            stream_id="abcd1234567890abcdef1234567890ab",
+            client_ip="10.0.0.1",
+            device_type="web",
+            resource_id=123,
+            cache_status="HIT",
+            response_bytes=1000,
+            time_to_first_byte_ms=100,
+            tcp_rtt_us=50000,
+            request_time_ms=150,
+            response_status=200,
+            client_country="US",
+            location_id="losangelesUSCA",
+            raw_data={},
+        )
+
+        tracker.update([event])
+        metrics = tracker.get_gauge_metrics()
+        region_metrics = [m for m in metrics if m['metric_name'] == 'cdn77_viewers_by_region']
+        assert region_metrics == []
+
+    def test_lookup_geo_uses_ip_cache(self):
+        """Geo lookup should be cached per IP to avoid repeated reader calls."""
+        tracker = SessionTracker(window_seconds=300)
+
+        class _FakeCountry:
+            iso_code = "US"
+
+        class _FakeSubdivision:
+            name = "California"
+
+        class _FakeSubdivisions:
+            most_specific = _FakeSubdivision()
+
+        class _FakeResponse:
+            country = _FakeCountry()
+            subdivisions = _FakeSubdivisions()
+
+        class _FakeReader:
+            def __init__(self):
+                self.calls = 0
+
+            def city(self, ip_address):
+                self.calls += 1
+                return _FakeResponse()
+
+        fake_reader = _FakeReader()
+        tracker.geoip_reader = fake_reader
+
+        first = tracker.lookup_geo("1.1.1.1")
+        second = tracker.lookup_geo("1.1.1.1")
+
+        assert first == ("US", "California")
+        assert second == ("US", "California")
+        assert fake_reader.calls == 1
+
+    def test_region_metric_has_expected_labels(self):
+        """Region metric should include stream/country/region/window labels."""
+        tracker = SessionTracker(window_seconds=300)
+        tracker.geoip_reader = object()
+
+        mapping = {
+            "10.0.0.1": ("US", "California"),
+            "10.0.0.2": ("AU", "New South Wales"),
+        }
+        tracker.lookup_geo = lambda ip: mapping.get(ip, ("XX", "Unknown"))
+
+        base_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+        events = [
+            Event(
+                timestamp=base_time,
+                stream_id="abcd1234567890abcdef1234567890ab",
+                client_ip="10.0.0.1",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="losangelesUSCA",
+                raw_data={},
+            ),
+            Event(
+                timestamp=base_time,
+                stream_id="abcd1234567890abcdef1234567890ab",
+                client_ip="10.0.0.2",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="AU",
+                location_id="sydneyAUNSW",
+                raw_data={},
+            ),
+        ]
+
+        tracker.update(events)
+        metrics = tracker.get_gauge_metrics()
+        region_metrics = [m for m in metrics if m['metric_name'] == 'cdn77_viewers_by_region']
+
+        assert len(region_metrics) == 2
+        for metric in region_metrics:
+            labels = metric['labels']
+            assert set(labels.keys()) == {'stream', 'country', 'region', 'window'}
+            assert labels['window'] == '5m'
+            assert labels['region'] != 'Unknown'
+
+    def test_sum_by_country_matches_region_rollup(self):
+        """Country totals should equal sum of region series per country (PromQL sum by country behavior)."""
+        tracker = SessionTracker(window_seconds=300)
+        tracker.geoip_reader = object()
+
+        mapping = {
+            "10.0.0.1": ("US", "California"),
+            "10.0.0.2": ("US", "Texas"),
+            "10.0.0.3": ("AU", "Victoria"),
+            "10.0.0.4": ("AU", "Queensland"),
+        }
+        tracker.lookup_geo = lambda ip: mapping.get(ip, ("XX", "Unknown"))
+
+        base_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+        stream_id = "abcd1234567890abcdef1234567890ab"
+
+        events = []
+        for ip, (country, _region) in mapping.items():
+            events.append(
+                Event(
+                    timestamp=base_time,
+                    stream_id=stream_id,
+                    client_ip=ip,
+                    device_type="web",
+                    resource_id=123,
+                    cache_status="HIT",
+                    response_bytes=1000,
+                    time_to_first_byte_ms=100,
+                    tcp_rtt_us=50000,
+                    request_time_ms=150,
+                    response_status=200,
+                    client_country=country,
+                    location_id="testPOP",
+                    raw_data={},
+                )
+            )
+
+        tracker.update(events)
+        metrics = tracker.get_gauge_metrics()
+
+        region_metrics = [m for m in metrics if m['metric_name'] == 'cdn77_viewers_by_region']
+        country_metrics = [m for m in metrics if m['metric_name'] == 'cdn77_viewers_by_country']
+
+        region_sum_by_country = {}
+        for metric in region_metrics:
+            country = metric['labels']['country']
+            region_sum_by_country[country] = region_sum_by_country.get(country, 0.0) + metric['value']
+
+        country_values = {m['labels']['country']: m['value'] for m in country_metrics}
+
+        assert region_sum_by_country == country_values
+        assert region_sum_by_country['US'] == 2.0
+        assert region_sum_by_country['AU'] == 2.0
+
 
 class TestSessionTrackerSimulation:
     """Large-scale simulation tests for session tracking"""

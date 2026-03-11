@@ -6,6 +6,7 @@ __pycache__/
 
 # Dev
 docker-compose.yml
+maxmind/
 
 # Testing
 .pytest_cache/

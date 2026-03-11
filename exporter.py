@@ -35,14 +35,6 @@ from botocore.exceptions import ClientError
 import requests
 import snappy
 
-try:
-    import geoip2.database
-    from geoip2.errors import AddressNotFoundError
-    GEOIP_AVAILABLE = True
-except ImportError:
-    GEOIP_AVAILABLE = False
-    logger.warning("GeoIP2 not available. Install with: pip install geoip2 maxminddb")
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -50,6 +42,14 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+try:
+    import geoip2.database
+    from geoip2.errors import AddressNotFoundError
+    GEOIP_AVAILABLE = True
+except ImportError:
+    GEOIP_AVAILABLE = False
+    logger.warning("GeoIP2 not available. Install with: pip install geoip2 maxminddb")
 
 
 # Metric prefix configuration
@@ -307,6 +307,10 @@ class SessionTracker:
         # Store: {stream_id: {ip_address: SessionInfo}}
         self.sessions: Dict[str, Dict[str, SessionInfo]] = defaultdict(dict)
         self._lock = threading.Lock()
+        self._geo_cache: Dict[str, Tuple[str, str]] = {}
+        self._geo_warning_count = 0
+        self._geo_warning_limit = 25
+        self._geo_reader_missing_logged = False
         
         # GeoIP lookup
         self.geoip_reader = None
@@ -316,7 +320,24 @@ class SessionTracker:
                 logger.info(f"GeoIP database loaded: {geoip_db_path}")
             except Exception as e:
                 logger.warning(f"Failed to load GeoIP database: {e}")
-    
+        elif geoip_db_path and not GEOIP_AVAILABLE:
+            logger.warning(
+                f"GEOIP_DB_PATH is set to '{geoip_db_path}', but geoip2/maxminddb libraries are unavailable; "
+                "region metrics will not be emitted"
+            )
+        else:
+            logger.warning(
+                "GEOIP_DB_PATH is not set; viewers_by_region metrics will not be emitted"
+            )
+
+    def _log_geo_warning(self, message: str):
+        """Rate-limit GeoIP warnings to avoid log spam."""
+        if self._geo_warning_count < self._geo_warning_limit:
+            logger.warning(message)
+            self._geo_warning_count += 1
+            if self._geo_warning_count == self._geo_warning_limit:
+                logger.warning("GeoIP warning log limit reached; suppressing further per-IP warnings")
+
     def lookup_geo(self, ip_address: str) -> Tuple[str, str]:
         """
         Lookup country and region for IP address
@@ -324,19 +345,41 @@ class SessionTracker:
         Returns:
             Tuple of (country_code, region_name)
         """
+        cached = self._geo_cache.get(ip_address)
+        if cached is not None:
+            return cached
+
         if not self.geoip_reader:
-            return ("XX", "Unknown")
+            if not self._geo_reader_missing_logged:
+                logger.warning(
+                    "GeoIP reader is not initialized; returning country='XX', region='Unknown' for lookups"
+                )
+                self._geo_reader_missing_logged = True
+            result = ("XX", "Unknown")
+            self._geo_cache[ip_address] = result
+            return result
         
         try:
             response = self.geoip_reader.city(ip_address)
             country = response.country.iso_code or "XX"
             region = response.subdivisions.most_specific.name if response.subdivisions else "Unknown"
-            return (country, region)
+            result = (country, region)
+            self._geo_cache[ip_address] = result
+            return result
         except (AddressNotFoundError, AttributeError):
-            return ("XX", "Unknown")
+            self._log_geo_warning(
+                f"GeoIP lookup unresolved for IP {ip_address}; using country='XX', region='Unknown'"
+            )
+            result = ("XX", "Unknown")
+            self._geo_cache[ip_address] = result
+            return result
         except Exception as e:
-            logger.debug(f"GeoIP lookup failed for {ip_address}: {e}")
-            return ("XX", "Unknown")
+            self._log_geo_warning(
+                f"GeoIP lookup failed for IP {ip_address}: {e}; using country='XX', region='Unknown'"
+            )
+            result = ("XX", "Unknown")
+            self._geo_cache[ip_address] = result
+            return result
     
     def update(self, events: List[Event]):
         """
@@ -345,13 +388,19 @@ class SessionTracker:
         """
         with self._lock:
             for event in events:
-                # Try to get country from event first, fallback to GeoIP lookup
+                # Try to get country from event first; region usually requires GeoIP
                 country = event.client_country if hasattr(event, 'client_country') and event.client_country else None
-                region = None
-                
-                # If not in event, try GeoIP lookup
+                region = "Unknown"
+
+                if self.geoip_reader:
+                    geo_country, geo_region = self.lookup_geo(event.client_ip)
+                    if not country:
+                        country = geo_country
+                    if geo_region:
+                        region = geo_region
+
                 if not country:
-                    country, region = self.lookup_geo(event.client_ip)
+                    country = "XX"
                 
                 # Update or create session info
                 current_session = self.sessions[event.stream_id].get(event.client_ip)
@@ -405,6 +454,7 @@ class SessionTracker:
             metrics = []
             now = datetime.now(timezone.utc)
             timestamp_ms = int(now.timestamp() * 1000) + batch_offset_ms
+            skipped_unknown_region_series = 0
             
             for stream_id, sessions in self.sessions.items():
                 if not sessions:
@@ -472,6 +522,14 @@ class SessionTracker:
                                 'window': self.window_label
                             }
                         })
+                    else:
+                        skipped_unknown_region_series += len(ips)
+
+            if skipped_unknown_region_series > 0:
+                logger.info(
+                    "Skipped viewers_by_region emission for %d unique sessions with unknown region",
+                    skipped_unknown_region_series,
+                )
             
             return metrics
     
@@ -1382,6 +1440,14 @@ class S3Importer:
         self.prometheus_retry_attempts = int(os.getenv('PROMETHEUS_RETRY_ATTEMPTS', '5'))
         self.prometheus_retry_base_delay_seconds = float(os.getenv('PROMETHEUS_RETRY_BASE_DELAY_SECONDS', '1.0'))
         self.prometheus_retry_max_delay_seconds = float(os.getenv('PROMETHEUS_RETRY_MAX_DELAY_SECONDS', '30.0'))
+
+        # Rolling-session gauges (viewers/viewers_by_*)
+        self.viewers_window_seconds = _env_int('SESSION_WINDOW_SECONDS', 7200)
+        self.geoip_db_path = os.getenv('GEOIP_DB_PATH')
+        self.session_tracker = SessionTracker(
+            window_seconds=self.viewers_window_seconds,
+            geoip_db_path=self.geoip_db_path,
+        )
         
         # Start writer thread
         self.writer_thread = PrometheusWriterThread(
@@ -1398,6 +1464,9 @@ class S3Importer:
         """Aggregate events into metrics and queue for Prometheus with batch offsets"""
         if not events:
             return
+
+        # Update rolling session state for gauge metrics emitted once per poll
+        self.session_tracker.update(events)
         
         now = datetime.now(timezone.utc)
         
@@ -1611,6 +1680,16 @@ class S3Importer:
         
         # Final flush check after processing all files
         self._check_and_flush_buffer()
+
+        # Emit rolling-window gauge snapshot once per poll (includes viewers_by_region)
+        self.session_tracker.expire_old(datetime.now(timezone.utc))
+        session_gauge_data = self.session_tracker.get_gauge_metrics(batch_offset_ms=self.startup_offset_ms)
+        session_gauge_metrics = self.exporter.build_gauge_metrics(session_gauge_data)
+        if session_gauge_metrics:
+            try:
+                self.write_queue.put((session_gauge_metrics, "SessionGauges"), timeout=5.0)
+            except queue.Full:
+                logger.error(f"Queue full! Dropping {len(session_gauge_metrics)} rolling session gauge metrics")
         
         # Wait for queue to empty
         logger.info("Waiting for writer thread to finish...")
