@@ -26,7 +26,7 @@
 
 ## Codebase Notes
 - `cdn77_users_total` is computed as per-minute unique client IP count per stream.
-- Metrics are emitted using minute timestamps with millisecond batch offsets.
+- All metric series must use timestamps aligned to processed log-event minute boundaries (UTC), with millisecond offsets only for duplicate-sample avoidance.
 - Parsing drops invalid/non-stream lines; there is no synthetic fallback metric emission.
 
 ## Documentation Rules
