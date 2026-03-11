@@ -707,7 +707,8 @@ def build_file_viewer_metrics(
         by_stream_ips[stream].add(ip)
         by_stream_device[(stream, event.device_type)].add(ip)
         track = extract_resolution_track(event)
-        by_stream_track[(stream, track)].add(ip)
+        if is_video_track(track):
+            by_stream_track[(stream, track)].add(ip)
 
         country = event.client_country if event.client_country else "XX"
         by_stream_country[(stream, country)].add(ip)
@@ -908,6 +909,13 @@ def extract_resolution_track(event: Event) -> str:
     return extract_track_from_path(path)
 
 
+def is_video_track(track: str) -> bool:
+    """Return True when track label represents video (v*) and not audio (a*)."""
+    if not track:
+        return False
+    return track.startswith('v')
+
+
 # Metric definitions
 METRIC_DEFINITIONS = [
     MetricDefinition(
@@ -1019,7 +1027,7 @@ METRIC_DEFINITIONS = [
     ),
     MetricDefinition(
         name=metric_name("users_by_resolution_total"),
-        value_extractor=lambda e: e.client_ip,
+        value_extractor=lambda e: e.client_ip if is_video_track(extract_resolution_track(e)) else None,
         aggregation=AggregationType.UNIQUE_COUNT,
         labels={
             "stream": extract_stream_id,
@@ -1029,7 +1037,7 @@ METRIC_DEFINITIONS = [
     ),
     MetricDefinition(
         name=metric_name("viewers_by_resolution"),
-        value_extractor=lambda e: e.client_ip,
+        value_extractor=lambda e: e.client_ip if is_video_track(extract_resolution_track(e)) else None,
         aggregation=AggregationType.UNIQUE_COUNT,
         labels={
             "stream": extract_stream_id,

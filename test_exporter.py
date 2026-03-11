@@ -368,6 +368,41 @@ class TestMetricAggregation:
         viewers_resolution = get_metric('cdn77_viewers_by_resolution', ('track', 'v3'))
         assert users_resolution['value'] == viewers_resolution['value']
         assert users_resolution['labels'] == viewers_resolution['labels']
+
+    def test_resolution_metrics_exclude_audio_tracks(self):
+        """Resolution metrics should include video tracks only and skip audio tracks."""
+        parser = LogParser()
+        aggregator = MetricAggregator(METRIC_DEFINITIONS)
+
+        base_time = datetime(2026, 1, 28, 12, 30, 0, tzinfo=timezone.utc)
+        stream_id = "abcd1230000000000000000000000001"
+
+        video_entry = generate_mock_log_entry(
+            timestamp=base_time,
+            client_ip="10.0.0.1",
+            stream_id=stream_id,
+        )
+        video_entry['clientRequestPath'] = f"/{stream_id}/tracks-v3/rewind-3600.fmp4.m3u8"
+
+        audio_entry = generate_mock_log_entry(
+            timestamp=base_time,
+            client_ip="10.0.0.2",
+            stream_id=stream_id,
+        )
+        audio_entry['clientRequestPath'] = f"/{stream_id}/tracks-a1/rewind-3600.fmp4.m3u8"
+
+        events = [
+            parser.parse_json_to_event(json.dumps(video_entry)),
+            parser.parse_json_to_event(json.dumps(audio_entry)),
+        ]
+        events = [e for e in events if e is not None]
+
+        computed = aggregator.compute_final_values(aggregator.aggregate_events(events))
+        resolution_metrics = [m for m in computed if m['metric_name'] == 'cdn77_viewers_by_resolution']
+
+        assert len(resolution_metrics) == 1
+        assert resolution_metrics[0]['labels']['track'] == 'v3'
+        assert resolution_metrics[0]['value'] == 1
     
     def test_ttfb_averaging(self):
         """Test time to first byte averaging"""
@@ -1402,6 +1437,24 @@ class TestFileViewerMetrics:
                     "clientRequestPath": f"/{stream_id}/tracks-v3/rewind-43200.fmp4.m3u8"
                 },
             ),
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.99",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="testPOP",
+                raw_data={
+                    "clientRequestPath": f"/{stream_id}/tracks-a1/rewind-43200.fmp4.m3u8"
+                },
+            ),
         ]
 
         geo = {
@@ -1416,10 +1469,10 @@ class TestFileViewerMetrics:
 
         metric_map = {m['metric']: m['value'] for m in metrics}
 
-        assert metric_map[f'cdn77_viewers{{stream="{stream_id}",stream_name="{stream_id}"}}'] == 2.0
+        assert metric_map[f'cdn77_viewers{{stream="{stream_id}",stream_name="{stream_id}"}}'] == 3.0
         assert metric_map[f'cdn77_viewers_by_device{{stream="{stream_id}",stream_name="{stream_id}",device_type="roku"}}'] == 1.0
-        assert metric_map[f'cdn77_viewers_by_device{{stream="{stream_id}",stream_name="{stream_id}",device_type="web"}}'] == 1.0
-        assert metric_map[f'cdn77_viewers_by_country{{stream="{stream_id}",stream_name="{stream_id}",country="US"}}'] == 2.0
+        assert metric_map[f'cdn77_viewers_by_device{{stream="{stream_id}",stream_name="{stream_id}",device_type="web"}}'] == 2.0
+        assert metric_map[f'cdn77_viewers_by_country{{stream="{stream_id}",stream_name="{stream_id}",country="US"}}'] == 3.0
         assert metric_map[f'cdn77_viewers_by_resolution{{stream="{stream_id}",stream_name="{stream_id}",track="v3"}}'] == 2.0
         assert metric_map[f'cdn77_viewers_by_region{{stream="{stream_id}",stream_name="{stream_id}",country="US",region="California"}}'] == 1.0
         assert metric_map[f'cdn77_viewers_by_region{{stream="{stream_id}",stream_name="{stream_id}",country="US",region="Texas"}}'] == 1.0
