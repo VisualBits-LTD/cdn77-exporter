@@ -2,6 +2,8 @@
 
 Daemon service that polls CDN77 S3-compatible storage for real-time access logs and exports transfer metrics to Prometheus.
 
+Copilot context for this repository: [`.github/copilot-instructions.md`](.github/copilot-instructions.md)
+
 ## Features
 
 - Polls S3 endpoint every 60 seconds for new log files
@@ -13,93 +15,114 @@ Daemon service that polls CDN77 S3-compatible storage for real-time access logs 
 
 ## Metrics Exported
 
-The exporter generates 11 metrics with rich dimensional labels (stream_name, cdn_id, cache_status, pop, response_status, device_type, country, region):
+Metric names are prefixed by `METRIC_PREFIX` (default: `cdn_`).
+Examples below use the legacy `cdn77_` prefix for compatibility with existing dashboards.
+
+The exporter generates 11 metrics with rich dimensional labels (stream, cdn_id, cache_status, pop, response_status, device_type, country, region):
 
 ### Counters (use with `rate()` or `increase()`)
 
 **`cdn77_transfer_bytes_total`**
 - Total bytes transferred (counter)
-- Labels: `stream_name`, `cdn_id`, `cache_status`, `pop`
-- Query bandwidth (bits/sec): `sum(rate(cdn77_transfer_bytes_total{stream_name="..."}[5m])) * 8`
-- Query total bytes in 5 minutes: `sum(increase(cdn77_transfer_bytes_total{stream_name="..."}[5m]))`
-- Query by location: `sum by (pop) (rate(cdn77_transfer_bytes_total{stream_name="..."}[5m]))`
+- Labels: `stream`, `cdn_id`, `cache_status`, `pop`
+- Query bandwidth (bits/sec): `sum(rate(cdn77_transfer_bytes_total{stream="..."}[5m])) * 8`
+- Query total bytes in 5 minutes: `sum(increase(cdn77_transfer_bytes_total{stream="..."}[5m]))`
+- Query by location: `sum by (pop) (rate(cdn77_transfer_bytes_total{stream="..."}[5m]))`
 
 **`cdn77_requests_total`**
 - Total number of requests (counter)
-- Labels: `stream_name`, `cdn_id`, `cache_status`, `pop`
-- Query requests/sec: `sum(rate(cdn77_requests_total{stream_name="..."}[5m]))`
-- Query total requests: `sum(increase(cdn77_requests_total{stream_name="..."}[1h]))`
-- Query by cache status: `sum by (cache_status) (rate(cdn77_requests_total{stream_name="..."}[5m]))`
+- Labels: `stream`, `cdn_id`, `cache_status`, `pop`
+- Query requests/sec: `sum(rate(cdn77_requests_total{stream="..."}[5m]))`
+- Query total requests: `sum(increase(cdn77_requests_total{stream="..."}[1h]))`
+- Query by cache status: `sum by (cache_status) (rate(cdn77_requests_total{stream="..."}[5m]))`
 
 **`cdn77_responses_total`**
 - Requests by HTTP status code (counter)
-- Labels: `stream_name`, `cdn_id`, `cache_status`, `pop`, `response_status`
-- Query 4xx error rate: `sum(rate(cdn77_responses_total{stream_name="...", response_status=~"4.."}[5m]))`
-- Query success rate: `sum(rate(cdn77_responses_total{stream_name="...", response_status="200"}[5m]))`
+- Labels: `stream`, `cdn_id`, `cache_status`, `pop`, `response_status`
+- Query 4xx error rate: `sum(rate(cdn77_responses_total{stream="...", response_status=~"4.."}[5m]))`
+- Query success rate: `sum(rate(cdn77_responses_total{stream="...", response_status="200"}[5m]))`
 
 **`cdn77_users_total`**
 - Count of unique IP addresses per stream (counter)
-- Labels: `stream_name`
-- Query unique users per stream: `cdn77_users_total{stream_name="..."}`
+- Labels: `stream`
+- Query unique users per stream: `cdn77_users_total{stream="..."}`
 - Query total unique users across all streams: `sum(cdn77_users_total)`
-- Query unique users rate: `rate(cdn77_users_total{stream_name="..."}[5m])`
+- Query unique users rate: `rate(cdn77_users_total{stream="..."}[5m])`
 
 **`cdn77_users_by_device_total`**
 - Count of unique IP addresses per stream by device type (counter)
-- Labels: `stream_name`, `device_type`
-- Device types: `baron_mobile`, `apple_tv`, `roku`, `firestick`, `android_tv`, `web`, `other`
-- Query Baron mobile vs OTT: `cdn77_users_by_device_total{stream_name="...", device_type=~"baron_mobile|apple_tv|roku|firestick"}`
-- Query by platform: `sum by (device_type) (cdn77_users_by_device_total{stream_name="..."})`
-- Compare platforms: `cdn77_users_by_device_total{stream_name="...", device_type="roku"}` vs `device_type="apple_tv"`
+- Labels: `stream`, `device_type`
+- Device types: `android`, `ios`, `apple_tv`, `roku`, `firestick`, `web`, `bots`, `streamology`, `other`
+- Query mobile vs OTT: `cdn77_users_by_device_total{stream="...", device_type=~"android|ios|apple_tv|roku|firestick"}`
+- Query by platform: `sum by (device_type) (cdn77_users_by_device_total{stream="..."})`
+- Compare platforms: `cdn77_users_by_device_total{stream="...", device_type="roku"}` vs `device_type="apple_tv"`
 
 **`cdn77_users_by_country_total`**
 - Count of unique IP addresses per stream by country (counter)
-- Labels: `stream_name`, `country`
+- Labels: `stream`, `country`
 - Country from CDN77 logs (ISO 3166-1 alpha-2)
-- Query unique users per country: `cdn77_users_by_country_total{stream_name="...", country="US"}`
-- Query top countries: `topk(10, cdn77_users_by_country_total{stream_name="..."})`
-- Query growth rate: `rate(cdn77_users_by_country_total{stream_name="...", country="US"}[5m])`
+- Query unique users per country: `cdn77_users_by_country_total{stream="...", country="US"}`
+- Query top countries: `topk(10, cdn77_users_by_country_total{stream="..."})`
+- Query growth rate: `rate(cdn77_users_by_country_total{stream="...", country="US"}[5m])`
 
 ### Gauges (use with `max_over_time()` or direct value)
 
-**`cdn77_active_viewers`**
+**`cdn77_viewers`**
 - Current unique viewers in rolling time window (gauge)
-- Labels: `stream_name`, `window`
+- Labels: `stream`, `window`
 - Tracks unique IPs over 2-hour rolling window (handles retroactive data)
-- Query current unique viewers: `cdn77_active_viewers{stream_name="...", window="2h"}`
-- Query peak during broadcast: `max_over_time(cdn77_active_viewers{stream_name="...", window="2h"}[3h])`
-- Query average concurrent: `avg_over_time(cdn77_active_viewers{stream_name="...", window="2h"}[1h])`
+- Query current unique viewers: `cdn77_viewers{stream="...", window="2h"}`
+- Query peak during broadcast: `max_over_time(cdn77_viewers{stream="...", window="2h"}[3h])`
+- Query average concurrent: `avg_over_time(cdn77_viewers{stream="...", window="2h"}[1h])`
 
-**`cdn77_active_viewers_by_device`**
+**`cdn77_viewers_by_device`**
 - Current unique viewers by device type in rolling window (gauge)
-- Labels: `stream_name`, `device_type`, `window`
-- Query by platform: `cdn77_active_viewers_by_device{stream_name="...", device_type="roku", window="2h"}`
-- Baron vs OTT: `sum by (device_type) (cdn77_active_viewers_by_device{stream_name="...", window="2h"})`
+- Labels: `stream`, `device_type`, `window`
+- Query by platform: `cdn77_viewers_by_device{stream="...", device_type="roku", window="2h"}`
+- Baron vs OTT: `sum by (device_type) (cdn77_viewers_by_device{stream="...", window="2h"})`
 
-**`cdn77_active_viewers_by_country`**
+**`cdn77_viewers_by_country`**
 - Current unique viewers by country in rolling window (gauge)
-- Labels: `stream_name`, `country`, `window`
+- Labels: `stream`, `country`, `window`
 - Requires GeoIP database (see setup below)
-- Query top countries: `topk(10, cdn77_active_viewers_by_country{stream_name="...", window="2h"})`
-- Query specific country: `cdn77_active_viewers_by_country{stream_name="...", country="US", window="2h"}`
+- Query top countries: `topk(10, cdn77_viewers_by_country{stream="...", window="2h"})`
+- Query specific country: `cdn77_viewers_by_country{stream="...", country="US", window="2h"}`
 
-**`cdn77_active_viewers_by_region`**
+**`cdn77_viewers_by_region`**
 - Current unique viewers by state/region in rolling window (gauge)
-- Labels: `stream_name`, `country`, `region`, `window`
+- Labels: `stream`, `country`, `region`, `window`
 - Requires GeoIP database (see setup below)
-- Query top regions: `topk(10, cdn77_active_viewers_by_region{stream_name="...", window="2h"})`
-- Query US states: `cdn77_active_viewers_by_region{stream_name="...", country="US", window="2h"}`
+- Query top regions: `topk(10, cdn77_viewers_by_region{stream="...", window="2h"})`
+- Query US states: `cdn77_viewers_by_region{stream="...", country="US", window="2h"}`
 
 **`cdn77_time_to_first_byte_ms`**
 - Average time to first byte in milliseconds (gauge)
-- Labels: `stream_name`, `cdn_id`, `cache_status`, `pop`
-- Query average TTFB: `avg_over_time(cdn77_time_to_first_byte_ms{stream_name="..."}[5m])`
-- Query by location: `avg by (pop) (avg_over_time(cdn77_time_to_first_byte_ms{stream_name="..."}[5m]))`
+- Labels: `stream`, `cdn_id`, `cache_status`, `pop`
+- Query average TTFB: `avg_over_time(cdn77_time_to_first_byte_ms{stream="..."}[5m])`
+- Query by location: `avg by (pop) (avg_over_time(cdn77_time_to_first_byte_ms{stream="..."}[5m]))`
+
+**`cdn77_file_process_time_seconds`**
+- Time to download, decompress, parse, and delete one log file (gauge)
+- Labels: `result` (`success` or `failure`)
+- Query average processing time: `avg_over_time(cdn77_file_process_time_seconds{result="success"}[5m])`
+- Query failure processing time: `avg_over_time(cdn77_file_process_time_seconds{result="failure"}[15m])`
+
+**`cdn77_file_lines_processed_total`**
+- Number of NDJSON lines processed per file (gauge-like per-file sample)
+- Labels: `result` (`success` or `failure`)
+- Query average lines/file: `avg_over_time(cdn77_file_lines_processed_total{result="success"}[5m])`
+- Query processing throughput estimate: `sum_over_time(cdn77_file_lines_processed_total{result="success"}[5m]) / 300`
+
+**`cdn_viewer_undefined_devices_total`**
+- Total unmatched device user-agent events observed in a poll cycle (gauge-like per-poll sample)
+- Labels: none
+- Query recent undefined-device load: `sum_over_time(cdn_viewer_undefined_devices_total[10m])`
+- Query average undefined devices per poll: `avg_over_time(cdn_viewer_undefined_devices_total[30m])`
 
 ### Label Dimensions
 
 All metrics include these labels for filtering and grouping:
-- `stream_name` - 32-character hex stream ID extracted from path
+- `stream` - 32-character hex stream ID extracted from path
 - `cdn_id` - CDN77 resource ID
 - `cache_status` - HIT, MISS, EXPIRED, etc.
 - `pop` - Edge location (e.g., "losangelesUSCA", "frankfurtDEHE")
@@ -180,7 +203,7 @@ Files contain approximately 30 seconds of log data, delivered with minimal laten
 
 ## GeoIP Setup (Optional)
 
-For geographic metrics (`cdn77_active_viewers_by_country` and `cdn77_active_viewers_by_region`), download the MaxMind GeoLite2 database:
+For geographic metrics (`cdn77_viewers_by_country` and `cdn77_viewers_by_region`), download the MaxMind GeoLite2 database:
 
 1. **Sign up for free MaxMind account:** https://dev.maxmind.com/geoip/geolite2-free-geolocation-data
 2. **Download GeoLite2-City.mmdb** (~70MB)
@@ -236,14 +259,25 @@ docker run -d \
   cdn77-s3-importer
 ```
 
-### Python Script (Development)
+### Container-First Development
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Run tests in Docker (uses Dockerfile test stage)
+docker build --target test -t cdn77-exporter:test .
 
-# Run S3 importer daemon
-python s3_importer.py
+# Build production image
+docker build --target production -t cdn77-exporter:prod .
+
+# Run exporter daemon from container
+docker run --rm --name cdn77-exporter \
+  -e S3_ENDPOINT=https://eu-1.cdn77-storage.com \
+  -e S3_BUCKET=real-time-logs-synwudjt \
+  -e S3_PREFIX=real-time-logs/all-logs \
+  -e S3_ACCESS_KEY=xxx \
+  -e S3_SECRET_KEY=xxx \
+  -e METRIC_PREFIX=cdn77_ \
+  -e PROMETHEUS_URL=https://prometheus.streamology.tv/api/v1/write \
+  cdn77-exporter:prod
 ```
 
 ## Configuration
@@ -261,6 +295,12 @@ python s3_importer.py
 - `LOOKBACK_HOURS` - How far back to check for files (default: 2)
 - `SESSION_WINDOW_SECONDS` - Rolling window for active viewer tracking (default: 7200 = 2 hours)
 - `GEOIP_DB_PATH` - Path to MaxMind GeoLite2-City.mmdb database (optional, for geographic metrics)
+- `PROMETHEUS_RETRY_ATTEMPTS` - Retries for failed remote-write pushes in writer thread (default: 5)
+- `PROMETHEUS_RETRY_BASE_DELAY_SECONDS` - Initial retry backoff delay (default: 1.0)
+- `PROMETHEUS_RETRY_MAX_DELAY_SECONDS` - Max retry backoff delay cap (default: 30.0)
+- `METRIC_PREFIX` - Prefix for all emitted metric names (default: `cdn_`, e.g. `cdn_users_total`)
+- `UNMATCHED_DEVICE_LOGGING` - Enable end-of-poll logging of user agents classified as `other` (default: `true`)
+- `UNMATCHED_DEVICE_MAX_TRACKED` - Maximum unique unmatched user agents tracked in memory (default: `5000`)
 
 ## How It Works
 
@@ -274,9 +314,14 @@ python s3_importer.py
    - Random startup offset: 0-999ms (logged at startup)
    - Batch increment: +100ms per batch for same minute
    - Example: 04:27:00.437, 04:27:00.537, 04:27:00.637 (all within 1 second of actual time)
-8. **Label Dimensions**: All metrics tagged with stream_name, cdn_id, cache_status, pop (location)
+8. **Label Dimensions**: All metrics tagged with stream, cdn_id, cache_status, pop (location)
 9. **Push to Prometheus**: Batched push via remote write API (protobuf + snappy compression)
 10. **Delete & Repeat**: Removes processed file from S3, waits for next poll
+
+**Writer Retry Behavior:**
+- Remote write failures (network/DNS/5xx) are retried in the writer thread with exponential backoff.
+- Duplicate-sample `400` responses are still handled with timestamp increment retries.
+- Retry tuning is controlled via `PROMETHEUS_RETRY_*` environment variables.
 
 **Processing Flow:**
 ```

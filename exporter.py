@@ -28,6 +28,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Callable, Any, Tuple
 from enum import Enum
+from urllib.parse import unquote
 
 import boto3
 from botocore.exceptions import ClientError
@@ -49,6 +50,92 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+
+# Metric prefix configuration
+METRIC_PREFIX = os.getenv('METRIC_PREFIX', 'cdn_')
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read integer environment variable with fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid integer for {name}={raw!r}; using default {default}")
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Read boolean environment variable with fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+UNMATCHED_DEVICE_LOGGING = _env_bool('UNMATCHED_DEVICE_LOGGING', True)
+UNMATCHED_DEVICE_MAX_TRACKED = _env_int('UNMATCHED_DEVICE_MAX_TRACKED', 5000)
+
+_unmatched_device_lock = threading.Lock()
+_unmatched_device_counts: Dict[str, int] = {}
+_unmatched_device_overflow_total = 0
+
+
+def metric_name(suffix: str) -> str:
+    """Build metric name with configured prefix."""
+    return f"{METRIC_PREFIX}{suffix}"
+
+
+def _log_unmatched_device(user_agent: str):
+    """Accumulate unmatched user agents for end-of-poll summary logging."""
+    if not UNMATCHED_DEVICE_LOGGING:
+        return
+
+    ua = user_agent.strip() if user_agent else ""
+    if not ua:
+        ua = "<empty>"
+
+    normalized = ua[:300]
+
+    global _unmatched_device_overflow_total
+    with _unmatched_device_lock:
+        if normalized in _unmatched_device_counts:
+            _unmatched_device_counts[normalized] += 1
+            return
+
+        if len(_unmatched_device_counts) < UNMATCHED_DEVICE_MAX_TRACKED:
+            _unmatched_device_counts[normalized] = 1
+        else:
+            _unmatched_device_overflow_total += 1
+
+
+def flush_unmatched_device_summary() -> int:
+    """Log unmatched user-agent counts, reset accumulator, and return total unmatched."""
+    if not UNMATCHED_DEVICE_LOGGING:
+        return 0
+
+    global _unmatched_device_overflow_total
+    with _unmatched_device_lock:
+        if not _unmatched_device_counts and _unmatched_device_overflow_total == 0:
+            return 0
+
+        counts = _unmatched_device_counts.copy()
+        overflow_total = _unmatched_device_overflow_total
+        _unmatched_device_counts.clear()
+        _unmatched_device_overflow_total = 0
+
+    total_unmatched = sum(counts.values()) + overflow_total
+    logger.info(
+        f"Unmatched device summary: total={total_unmatched}, unique={len(counts)}, overflow={overflow_total}"
+    )
+
+    for user_agent, count in sorted(counts.items(), key=lambda item: item[1], reverse=True):
+        logger.info(f"Unmatched user-agent count={count}: {user_agent}")
+
+    return total_unmatched
 
 
 # ============================================================================
@@ -306,10 +393,10 @@ class SessionTracker:
         Generate gauge metrics for current session state.
         
         Returns metrics representing unique viewers in the rolling window:
-        - cdn77_active_viewers: Total unique IPs per stream
-        - cdn77_active_viewers_by_device: Unique IPs per stream per device
-        - cdn77_active_viewers_by_country: Unique IPs per stream per country
-        - cdn77_active_viewers_by_region: Unique IPs per stream per region
+        - cdn77_viewers: Total unique IPs per stream
+        - cdn77_viewers_by_device: Unique IPs per stream per device
+        - cdn77_viewers_by_country: Unique IPs per stream per country
+        - cdn77_viewers_by_region: Unique IPs per stream per region
         
         Args:
             batch_offset_ms: Millisecond offset to prevent duplicate timestamps
@@ -325,11 +412,11 @@ class SessionTracker:
                 
                 # Total unique viewers
                 metrics.append({
-                    'metric_name': 'cdn77_active_viewers',
+                    'metric_name': metric_name('viewers'),
                     'value': float(len(sessions)),
                     'timestamp_ms': timestamp_ms,
                     'labels': {
-                        'stream_name': stream_id,
+                        'stream': stream_id,
                         'window': self.window_label
                     }
                 })
@@ -347,11 +434,11 @@ class SessionTracker:
                 # Device metrics
                 for device_type, ips in by_device.items():
                     metrics.append({
-                        'metric_name': 'cdn77_active_viewers_by_device',
+                        'metric_name': metric_name('viewers_by_device'),
                         'value': float(len(ips)),
                         'timestamp_ms': timestamp_ms,
                         'labels': {
-                            'stream_name': stream_id,
+                            'stream': stream_id,
                             'device_type': device_type,
                             'window': self.window_label
                         }
@@ -360,11 +447,11 @@ class SessionTracker:
                 # Country metrics
                 for country, ips in by_country.items():
                     metrics.append({
-                        'metric_name': 'cdn77_active_viewers_by_country',
+                        'metric_name': metric_name('viewers_by_country'),
                         'value': float(len(ips)),
                         'timestamp_ms': timestamp_ms,
                         'labels': {
-                            'stream_name': stream_id,
+                            'stream': stream_id,
                             'country': country,
                             'window': self.window_label
                         }
@@ -375,11 +462,11 @@ class SessionTracker:
                     country, region = region_key.split('_', 1)
                     if region != "Unknown":  # Skip unknown regions
                         metrics.append({
-                            'metric_name': 'cdn77_active_viewers_by_region',
+                            'metric_name': metric_name('viewers_by_region'),
                             'value': float(len(ips)),
                             'timestamp_ms': timestamp_ms,
                             'labels': {
-                                'stream_name': stream_id,
+                                'stream': stream_id,
                                 'country': country,
                                 'region': region,
                                 'window': self.window_label
@@ -408,26 +495,24 @@ def detect_device_type(user_agent: str) -> str:
     Detect device type from User-Agent string
     
     Returns:
-        - baron_mobile: Baron iOS/Android app
+        - ios: iPhone/iPad/tvOS-adjacent iOS app playback
+        - android: Android mobile/tablet app playback
         - apple_tv: Apple TV / tvOS
         - roku: Roku devices
         - firestick: Amazon Fire TV
-        - android_tv: Android TV devices
         - web: Desktop/mobile browsers
+        - bots: Automated clients/crawlers/bots
+        - streamology: Streamology playback/ingest client signatures
         - other: Unknown devices
     """
     if not user_agent:
+        _log_unmatched_device(user_agent)
         return "other"
-    
-    ua_lower = user_agent.lower()
-    
-    # Baron mobile app detection (customize based on your app's UA string)
-    if "baron" in ua_lower or "virtualrailfan" in ua_lower:
-        if "ios" in ua_lower or "iphone" in ua_lower or "ipad" in ua_lower:
-            return "baron_mobile"
-        if "android" in ua_lower and "mobile" in ua_lower:
-            return "baron_mobile"
-    
+
+    # Decode percent-encoded user-agents to improve matching (e.g. Virtual%20Railfan)
+    normalized_ua = unquote(user_agent).strip()
+    ua_lower = normalized_ua.lower()
+
     # OTT Platform detection
     if "appletv" in ua_lower or "apple tv" in ua_lower or "tvos" in ua_lower:
         return "apple_tv"
@@ -437,14 +522,66 @@ def detect_device_type(user_agent: str) -> str:
     
     if "aft" in ua_lower or "amazon" in ua_lower and "fire" in ua_lower:
         return "firestick"
-    
-    if "android" in ua_lower and "tv" in ua_lower:
-        return "android_tv"
+
+    # Bot / automation fingerprints
+    if any(bot in ua_lower for bot in [
+        "bot",
+        "crawler",
+        "spider",
+        "scraper",
+        "headless",
+        "frame capture",
+        "yallbot",
+    ]):
+        return "bots"
+
+    # First-party app names mapped to platform
+    if "baron" in ua_lower or "virtualrailfan" in ua_lower or "virtual railfan" in ua_lower:
+        if "android" in ua_lower:
+            return "android"
+        if "ios" in ua_lower or "iphone" in ua_lower or "ipad" in ua_lower:
+            return "ios"
+
+    # iOS app and platform fingerprints
+    if (
+        "iphone" in ua_lower
+        or "ipad" in ua_lower
+        or "cpu os" in ua_lower
+        or "applecoremedia" in ua_lower
+    ):
+        return "ios"
+
+    # Android app and platform fingerprints
+    if (
+        "android" in ua_lower
+        or "androidxmedia3" in ua_lower
+        or "exoplayer" in ua_lower
+        or "dalvik" in ua_lower
+    ):
+        return "android"
+
+    # Streamology playback/ingest signatures
+    if (
+        ua_lower.startswith("lavf/")
+        or "gstreamer" in ua_lower
+        or "gst-launch" in ua_lower
+        or "libgst" in ua_lower
+    ):
+        return "streamology"
+
+    # Ambiguous network/client library signatures are treated as other
+    if "cfnetwork/" in ua_lower:
+        return "other"
+
+    # Network/client library signatures often used by app-embedded web players
+    if "darwin/" in ua_lower:
+        return "web"
     
     # Web browsers
     if any(browser in ua_lower for browser in ["chrome", "firefox", "safari", "edge", "opera"]):
         return "web"
     
+    _log_unmatched_device(normalized_ua)
     return "other"
 
 
@@ -481,11 +618,11 @@ def extract_device_type(event: Event) -> str:
 # Metric definitions
 METRIC_DEFINITIONS = [
     MetricDefinition(
-        name="cdn77_transfer_bytes_total",
+        name=metric_name("transfer_bytes_total"),
         value_extractor=lambda e: float(e.response_bytes),
         aggregation=AggregationType.SUM,
         labels={
-            "stream_name": extract_stream_id,
+            "stream": extract_stream_id,
             "cdn_id": extract_cdn_id,
             "cache_status": extract_cache_status,
             "pop": extract_location_id,
@@ -493,11 +630,11 @@ METRIC_DEFINITIONS = [
         help_text="Total bytes transferred per stream"
     ),
     MetricDefinition(
-        name="cdn77_time_to_first_byte_ms",
+        name=metric_name("time_to_first_byte_ms"),
         value_extractor=lambda e: float(e.time_to_first_byte_ms) if e.time_to_first_byte_ms > 0 else None,
         aggregation=AggregationType.AVG,
         labels={
-            "stream_name": extract_stream_id,
+            "stream": extract_stream_id,
             "cdn_id": extract_cdn_id,
             "cache_status": extract_cache_status,
             "pop": extract_location_id,
@@ -505,11 +642,11 @@ METRIC_DEFINITIONS = [
         help_text="Average time to first byte in milliseconds"
     ),
     MetricDefinition(
-        name="cdn77_requests_total",
+        name=metric_name("requests_total"),
         value_extractor=lambda e: 1.0,
         aggregation=AggregationType.SUM,
         labels={
-            "stream_name": extract_stream_id,
+            "stream": extract_stream_id,
             "cdn_id": extract_cdn_id,
             "cache_status": extract_cache_status,
             "pop": extract_location_id,
@@ -517,11 +654,11 @@ METRIC_DEFINITIONS = [
         help_text="Total number of requests"
     ),
     MetricDefinition(
-        name="cdn77_responses_total",
+        name=metric_name("responses_total"),
         value_extractor=lambda e: 1.0,
         aggregation=AggregationType.SUM,
         labels={
-            "stream_name": extract_stream_id,
+            "stream": extract_stream_id,
             "cdn_id": extract_cdn_id,
             "cache_status": extract_cache_status,
             "response_status": extract_response_status,
@@ -530,33 +667,62 @@ METRIC_DEFINITIONS = [
         help_text="Request count by HTTP response status code"
     ),
     MetricDefinition(
-        name="cdn77_users_total",
+        name=metric_name("users_total"),
         value_extractor=lambda e: e.client_ip,  # Value is the IP address itself
         aggregation=AggregationType.UNIQUE_COUNT,
         labels={
-            "stream_name": extract_stream_id,
+            "stream": extract_stream_id,
         },
         help_text="Count of unique IP addresses per stream"
     ),
     MetricDefinition(
-        name="cdn77_users_by_device_total",
+        name=metric_name("viewers"),
+        value_extractor=lambda e: e.client_ip,  # Compatibility alias for users metric
+        aggregation=AggregationType.UNIQUE_COUNT,
+        labels={
+            "stream": extract_stream_id,
+        },
+        help_text="Compatibility alias of cdn77_users_total"
+    ),
+    MetricDefinition(
+        name=metric_name("users_by_device_total"),
         value_extractor=lambda e: e.client_ip,  # Value is the IP address itself
         aggregation=AggregationType.UNIQUE_COUNT,
         labels={
-            "stream_name": extract_stream_id,
+            "stream": extract_stream_id,
             "device_type": extract_device_type,
         },
         help_text="Count of unique IP addresses per stream by device type"
     ),
     MetricDefinition(
-        name="cdn77_users_by_country_total",
+        name=metric_name("viewers_by_device"),
+        value_extractor=lambda e: e.client_ip,  # Compatibility alias for users metric
+        aggregation=AggregationType.UNIQUE_COUNT,
+        labels={
+            "stream": extract_stream_id,
+            "device_type": extract_device_type,
+        },
+        help_text="Compatibility alias of cdn77_users_by_device_total"
+    ),
+    MetricDefinition(
+        name=metric_name("users_by_country_total"),
         value_extractor=lambda e: e.client_ip,  # Value is the IP address itself
         aggregation=AggregationType.UNIQUE_COUNT,
         labels={
-            "stream_name": extract_stream_id,
+            "stream": extract_stream_id,
             "country": extract_client_country,
         },
         help_text="Count of unique IP addresses per stream by country"
+    ),
+    MetricDefinition(
+        name=metric_name("viewers_by_country"),
+        value_extractor=lambda e: e.client_ip,  # Compatibility alias for users metric
+        aggregation=AggregationType.UNIQUE_COUNT,
+        labels={
+            "stream": extract_stream_id,
+            "country": extract_client_country,
+        },
+        help_text="Compatibility alias of cdn77_users_by_country_total"
     ),
 ]
 
@@ -1073,8 +1239,8 @@ class PrometheusExporter:
             
         except requests.exceptions.HTTPError as e:
             # Check if it's a duplicate timestamp error
-            if (hasattr(e, 'response') and e.response is not None and 
-                e.response.status_code == 400 and 
+            if (hasattr(e, 'response') and e.response is not None and
+                e.response.status_code == 400 and
                 'duplicate sample' in e.response.text and 
                 retry_count < 5):
                 
@@ -1103,13 +1269,49 @@ class PrometheusExporter:
 class PrometheusWriterThread(threading.Thread):
     """Background thread that handles Prometheus write operations"""
     
-    def __init__(self, exporter: PrometheusExporter, write_queue: queue.Queue):
+    def __init__(
+        self,
+        exporter: PrometheusExporter,
+        write_queue: queue.Queue,
+        max_retry_attempts: int = 5,
+        retry_base_delay_seconds: float = 1.0,
+        retry_max_delay_seconds: float = 30.0,
+    ):
         super().__init__(daemon=True, name="PrometheusWriter")
         self.exporter = exporter
         self.write_queue = write_queue
         self.running = True
         self.metrics_written = 0
         self.metrics_failed = 0
+        self.max_retry_attempts = max_retry_attempts
+        self.retry_base_delay_seconds = retry_base_delay_seconds
+        self.retry_max_delay_seconds = retry_max_delay_seconds
+
+    def _push_with_retries(self, metrics: List[Dict], source: str) -> bool:
+        """Push metrics with bounded exponential backoff retries for transient failures."""
+        log_prefix = f"[{source}] "
+
+        for attempt in range(self.max_retry_attempts + 1):
+            if self.exporter.push_metrics(metrics, log_prefix):
+                return True
+
+            if attempt >= self.max_retry_attempts:
+                break
+
+            delay = min(
+                self.retry_base_delay_seconds * (2 ** attempt),
+                self.retry_max_delay_seconds,
+            )
+            logger.warning(
+                f"{log_prefix}Push failed, retrying in {delay:.1f}s "
+                f"(attempt {attempt + 1}/{self.max_retry_attempts})"
+            )
+            time.sleep(delay)
+
+        logger.error(
+            f"{log_prefix}Exhausted retries after {self.max_retry_attempts + 1} attempts"
+        )
+        return False
     
     def run(self):
         """Process metrics from queue and write to Prometheus"""
@@ -1126,9 +1328,8 @@ class PrometheusWriterThread(threading.Thread):
                     break
                 
                 metrics, source = job
-                log_prefix = f"[{source}] "
-                
-                if self.exporter.push_metrics(metrics, log_prefix):
+
+                if self._push_with_retries(metrics, source):
                     self.metrics_written += len(metrics)
                 else:
                     self.metrics_failed += len(metrics)
@@ -1176,9 +1377,20 @@ class S3Importer:
         
         # Track dropped events (for statistics)
         self.dropped_events = 0
+
+        # Prometheus retry settings
+        self.prometheus_retry_attempts = int(os.getenv('PROMETHEUS_RETRY_ATTEMPTS', '5'))
+        self.prometheus_retry_base_delay_seconds = float(os.getenv('PROMETHEUS_RETRY_BASE_DELAY_SECONDS', '1.0'))
+        self.prometheus_retry_max_delay_seconds = float(os.getenv('PROMETHEUS_RETRY_MAX_DELAY_SECONDS', '30.0'))
         
         # Start writer thread
-        self.writer_thread = PrometheusWriterThread(self.exporter, self.write_queue)
+        self.writer_thread = PrometheusWriterThread(
+            self.exporter,
+            self.write_queue,
+            max_retry_attempts=self.prometheus_retry_attempts,
+            retry_base_delay_seconds=self.prometheus_retry_base_delay_seconds,
+            retry_max_delay_seconds=self.prometheus_retry_max_delay_seconds,
+        )
         self.writer_thread.start()
         self.last_flush_time = datetime.now(timezone.utc)
     
@@ -1262,12 +1474,37 @@ class S3Importer:
     
     def process_file(self, s3_key: str) -> bool:
         """Download, decompress, parse, and buffer events (no immediate flush)"""
+        started_at = time.monotonic()
+        lines_processed = 0
+
+        def emit_file_processing_metrics(success: bool, processed_lines: int):
+            duration_seconds = time.monotonic() - started_at
+            timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            result_label = "success" if success else "failure"
+            metrics = [
+                {
+                    'metric': f'{metric_name("file_process_time_seconds")}{{result="{result_label}"}}',
+                    'value': duration_seconds,
+                    'timestamp': timestamp_ms,
+                },
+                {
+                    'metric': f'{metric_name("file_lines_processed_total")}{{result="{result_label}"}}',
+                    'value': float(processed_lines),
+                    'timestamp': timestamp_ms,
+                },
+            ]
+            try:
+                self.write_queue.put((metrics, "FileProcessMetrics"), timeout=1.0)
+            except queue.Full:
+                logger.error("Queue full! Dropping file processing metrics")
+
         try:
             logger.info(f"Processing: {s3_key}")
             
             # Download file
             compressed_data = self.s3_client.download_object(s3_key)
             if not compressed_data:
+                emit_file_processing_metrics(False, lines_processed)
                 return False
             
             # Decompress gzip
@@ -1275,11 +1512,11 @@ class S3Importer:
                 ndjson_content = gzip.decompress(compressed_data).decode('utf-8')
             except Exception as e:
                 logger.error(f"Failed to decompress {s3_key}: {e}")
+                emit_file_processing_metrics(False, lines_processed)
                 return False
             
             # Parse events from file
             events = []
-            lines_processed = 0
             invalid_lines = 0
             
             for line in ndjson_content.splitlines():
@@ -1314,11 +1551,14 @@ class S3Importer:
             
             # Delete from S3 after successful processing
             self.s3_client.delete_object(s3_key)
+
+            emit_file_processing_metrics(True, lines_processed)
             
             return True
             
         except Exception as e:
             logger.error(f"Error processing {s3_key}: {e}", exc_info=True)
+            emit_file_processing_metrics(False, lines_processed)
             return False
     
     def get_prefix_for_lookback(self, lookback_hours: int) -> List[str]:
@@ -1382,6 +1622,21 @@ class S3Importer:
                    f"{buffered_count} events buffered")
         logger.info(f"Writer stats: {self.writer_thread.metrics_written} written, "
                    f"{self.writer_thread.metrics_failed} failed")
+
+        # Emit unmatched user-agent summary once per poll cycle
+        total_undefined_devices = flush_unmatched_device_summary()
+
+        if total_undefined_devices > 0:
+            undefined_metric = {
+                'metric': f'{metric_name("viewer_undefined_devices_total")}{{}}',
+                'value': float(total_undefined_devices),
+                'timestamp': int(datetime.now(timezone.utc).timestamp() * 1000),
+            }
+            try:
+                self.write_queue.put(([undefined_metric], "UndefinedDevices"), timeout=1.0)
+                self.write_queue.join()
+            except queue.Full:
+                logger.error("Queue full! Dropping viewer_undefined_devices_total metric")
         
         # Memory diagnostics
         logger.info(f"Memory tracking: flush_count_per_minute={len(self.flush_count_per_minute)} entries, "

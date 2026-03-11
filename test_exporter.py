@@ -7,14 +7,19 @@ Generates mock log data and validates metric processing
 import json
 import gzip
 import random
+import queue
+import os
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict
 import pytest
+
+os.environ.setdefault("METRIC_PREFIX", "cdn77_")
 
 from exporter import (
     Event, LogParser, MetricAggregator, AggregationType,
     MetricDefinition, METRIC_DEFINITIONS, detect_device_type,
     SessionTracker, SessionInfo,
+    PrometheusWriterThread,
     extract_stream_id, extract_cdn_id, extract_cache_status,
     extract_location_id, extract_response_status, extract_client_ip, extract_device_type
 )
@@ -253,7 +258,7 @@ class TestMetricAggregation:
         # Find users metric
         users_metric = [m for m in computed if m['metric_name'] == 'cdn77_users_total'][0]
         assert users_metric['value'] == 5  # Should count 5 unique IPs
-        assert users_metric['labels']['stream_name'] == stream_id
+        assert users_metric['labels']['stream'] == stream_id
     
     def test_unique_ip_per_stream(self):
         """Test unique IP counting per stream (separate counts)"""
@@ -286,8 +291,8 @@ class TestMetricAggregation:
         # Find users metrics for each stream
         users_metrics = [m for m in computed if m['metric_name'] == 'cdn77_users_total']
         
-        stream1_metric = [m for m in users_metrics if m['labels']['stream_name'] == stream1][0]
-        stream2_metric = [m for m in users_metrics if m['labels']['stream_name'] == stream2][0]
+        stream1_metric = [m for m in users_metrics if m['labels']['stream'] == stream1][0]
+        stream2_metric = [m for m in users_metrics if m['labels']['stream'] == stream2][0]
         
         assert stream1_metric['value'] == 3
         assert stream2_metric['value'] == 2
@@ -311,6 +316,51 @@ class TestMetricAggregation:
         
         requests_metric = [m for m in computed if m['metric_name'] == 'cdn77_requests_total'][0]
         assert requests_metric['value'] == 50
+
+    def test_users_and_viewers_aliases_match(self):
+        """Ensure compatibility aliases emit the same values/labels as users metrics"""
+        parser = LogParser()
+        aggregator = MetricAggregator(METRIC_DEFINITIONS)
+
+        base_time = datetime(2026, 1, 28, 12, 30, 0, tzinfo=timezone.utc)
+        stream_id = "abcd1230000000000000000000000001"
+
+        events = []
+        for ip in ["10.0.0.1", "10.0.0.2", "10.0.0.2", "10.0.0.3"]:
+            entry = generate_mock_log_entry(
+                timestamp=base_time,
+                client_ip=ip,
+                stream_id=stream_id,
+                user_agent="Roku/DVP-11.0",
+            )
+            entry['clientCountry'] = 'US'
+            event = parser.parse_json_to_event(json.dumps(entry))
+            if event:
+                events.append(event)
+
+        computed = aggregator.compute_final_values(aggregator.aggregate_events(events))
+
+        def get_metric(metric_name, extra_label=None):
+            matches = [m for m in computed if m['metric_name'] == metric_name]
+            if extra_label is None:
+                return matches[0]
+            key, value = extra_label
+            return [m for m in matches if m['labels'][key] == value][0]
+
+        users_total = get_metric('cdn77_users_total')
+        viewers_total = get_metric('cdn77_viewers')
+        assert users_total['value'] == viewers_total['value']
+        assert users_total['labels'] == viewers_total['labels']
+
+        users_device = get_metric('cdn77_users_by_device_total', ('device_type', 'roku'))
+        viewers_device = get_metric('cdn77_viewers_by_device', ('device_type', 'roku'))
+        assert users_device['value'] == viewers_device['value']
+        assert users_device['labels'] == viewers_device['labels']
+
+        users_country = get_metric('cdn77_users_by_country_total', ('country', 'US'))
+        viewers_country = get_metric('cdn77_viewers_by_country', ('country', 'US'))
+        assert users_country['value'] == viewers_country['value']
+        assert users_country['labels'] == viewers_country['labels']
     
     def test_ttfb_averaging(self):
         """Test time to first byte averaging"""
@@ -441,25 +491,38 @@ class TestDeviceDetection:
         assert detect_device_type("Dalvik/2.1.0 (Linux; U; Android 9; AFTMM Build/PS7633)") == "firestick"
         assert detect_device_type("Amazon Fire TV Stick") == "firestick"
     
-    def test_detect_android_tv(self):
-        """Test Android TV detection"""
-        assert detect_device_type("AndroidTV/10.0") == "android_tv"
+    def test_detect_android(self):
+        """Test Android detection"""
+        assert detect_device_type("AndroidTV/10.0") == "android"
+        assert detect_device_type("Dalvik/2.1.0 (Linux; U; Android 13; Pixel 7)") == "android"
     
     def test_detect_web(self):
         """Test web browser detection"""
         assert detect_device_type("Mozilla/5.0 Chrome/120.0.0.0") == "web"
         assert detect_device_type("Mozilla/5.0 Firefox/121.0") == "web"
         assert detect_device_type("Mozilla/5.0 Safari/605.1") == "web"
+
+    def test_detect_bots(self):
+        """Test bot detection"""
+        assert detect_device_type("Mozilla/5.0 (Yallbot Camera Frame Capture)") == "bots"
+        assert detect_device_type("ExampleCrawler/1.0") == "bots"
+
+    def test_detect_streamology(self):
+        """Test streamology playback/ingest signatures"""
+        assert detect_device_type("Lavf/61.7.100") == "streamology"
+        assert detect_device_type("GStreamer/1.22.9") == "streamology"
+        assert detect_device_type("gst-launch-1.0/1.20") == "streamology"
     
-    def test_detect_baron_mobile(self):
-        """Test Baron mobile app detection"""
-        assert detect_device_type("Baron iOS App/1.0") == "baron_mobile"
-        assert detect_device_type("VirtualRailFan Android Mobile/2.0") == "baron_mobile"
+    def test_detect_ios(self):
+        """Test iOS detection"""
+        assert detect_device_type("Baron iOS App/1.0") == "ios"
+        assert detect_device_type("AppleCoreMedia/1.0.0 (iPhone; U; CPU OS 18_5 like Mac OS X; en_us)") == "ios"
     
     def test_detect_other(self):
         """Test unknown device detection"""
         assert detect_device_type("") == "other"
         assert detect_device_type("UnknownDevice/1.0") == "other"
+        assert detect_device_type("Matt Laubhan IOS/7.0.9 CFNetwork/3860.400.51 Darwin/25.3.0") == "other"
     
     def test_device_in_parsed_event(self):
         """Test device type is extracted during parsing"""
@@ -881,16 +944,16 @@ class TestSessionTracker:
         
         # Should have total, by_device, and by_country metrics
         metric_names = {m['metric_name'] for m in metrics}
-        assert 'cdn77_active_viewers' in metric_names
-        assert 'cdn77_active_viewers_by_device' in metric_names
-        assert 'cdn77_active_viewers_by_country' in metric_names
+        assert 'cdn77_viewers' in metric_names
+        assert 'cdn77_viewers_by_device' in metric_names
+        assert 'cdn77_viewers_by_country' in metric_names
         
         # Check total viewers
-        total_metric = [m for m in metrics if m['metric_name'] == 'cdn77_active_viewers'][0]
+        total_metric = [m for m in metrics if m['metric_name'] == 'cdn77_viewers'][0]
         assert total_metric['value'] == 3.0
         
         # Check device breakdown
-        device_metrics = [m for m in metrics if m['metric_name'] == 'cdn77_active_viewers_by_device']
+        device_metrics = [m for m in metrics if m['metric_name'] == 'cdn77_viewers_by_device']
         roku_count = [m for m in device_metrics if m['labels']['device_type'] == 'roku'][0]['value']
         apple_tv_count = [m for m in device_metrics if m['labels']['device_type'] == 'apple_tv'][0]['value']
         assert roku_count == 2.0
@@ -951,7 +1014,7 @@ class TestSessionTracker:
         
         # Generate metrics - should show increased count
         metrics = tracker.get_gauge_metrics()
-        total_metric = [m for m in metrics if m['metric_name'] == 'cdn77_active_viewers'][0]
+        total_metric = [m for m in metrics if m['metric_name'] == 'cdn77_viewers'][0]
         assert total_metric['value'] == 2.0
 
 
@@ -1022,7 +1085,7 @@ class TestSessionTrackerSimulation:
                     ground_truth[stream_id][ip] = batch_time
                     
                     # Create event
-                    device_types = ["roku", "apple_tv", "web", "firestick", "baron_mobile"]
+                    device_types = ["roku", "apple_tv", "web", "firestick", "android", "ios"]
                     event = Event(
                         timestamp=batch_time,
                         stream_id=stream_id,
@@ -1071,8 +1134,8 @@ class TestSessionTrackerSimulation:
                 # Validate counts are close (within 5% due to timing)
                 for stream_id in streams:
                     stream_metrics = [m for m in metrics 
-                                    if m['metric_name'] == 'cdn77_active_viewers' 
-                                    and m['labels']['stream_name'] == stream_id]
+                                    if m['metric_name'] == 'cdn77_viewers' 
+                                    and m['labels']['stream'] == stream_id]
                     if stream_metrics:
                         actual = int(stream_metrics[0]['value'])
                         expected = expected_per_stream.get(stream_id, 0)
@@ -1097,9 +1160,9 @@ class TestSessionTrackerSimulation:
         
         # Verify we have metrics for all dimensions
         metric_types = {m['metric_name'] for m in final_metrics}
-        assert 'cdn77_active_viewers' in metric_types
-        assert 'cdn77_active_viewers_by_device' in metric_types
-        assert 'cdn77_active_viewers_by_country' in metric_types
+        assert 'cdn77_viewers' in metric_types
+        assert 'cdn77_viewers_by_device' in metric_types
+        assert 'cdn77_viewers_by_country' in metric_types
     
     def test_retroactive_data_accumulation(self):
         """
@@ -1165,7 +1228,7 @@ class TestSessionTrackerSimulation:
             
             # Generate metrics
             metrics = tracker.get_gauge_metrics()
-            viewer_metric = [m for m in metrics if m['metric_name'] == 'cdn77_active_viewers'][0]
+            viewer_metric = [m for m in metrics if m['metric_name'] == 'cdn77_viewers'][0]
             
             print(f"File {file_num+1:2d} | "
                   f"New IPs in file: {len(ips_in_this_file):3d} | "
@@ -1278,7 +1341,8 @@ class TestSessionTrackerSimulation:
             "apple_tv": 0.25,    # 25%
             "web": 0.20,         # 20%
             "firestick": 0.15,   # 15%
-            "baron_mobile": 0.05 # 5%
+            "android": 0.10,    # 10%
+            "ios": 0.10         # 10%
         }
         
         country_distribution = {
@@ -1349,7 +1413,7 @@ class TestSessionTrackerSimulation:
         print(f"{'Device':<15} {'Generated':<12} {'Expected %':<12} {'Tracked':<12} {'Tracked %':<12}")
         print("-" * 70)
         
-        device_metrics = [m for m in metrics if m['metric_name'] == 'cdn77_active_viewers_by_device']
+        device_metrics = [m for m in metrics if m['metric_name'] == 'cdn77_viewers_by_device']
         for device, expected_pct in sorted(device_distribution.items()):
             generated = generated_by_device[device]
             metric = [m for m in device_metrics if m['labels']['device_type'] == device]
@@ -1367,7 +1431,7 @@ class TestSessionTrackerSimulation:
         print(f"{'Country':<15} {'Generated':<12} {'Expected %':<12} {'Tracked':<12} {'Tracked %':<12}")
         print("-" * 70)
         
-        country_metrics = [m for m in metrics if m['metric_name'] == 'cdn77_active_viewers_by_country']
+        country_metrics = [m for m in metrics if m['metric_name'] == 'cdn77_viewers_by_country']
         for country, expected_pct in sorted(country_distribution.items()):
             generated = generated_by_country[country]
             metric = [m for m in country_metrics if m['labels']['country'] == country]
@@ -1383,6 +1447,50 @@ class TestSessionTrackerSimulation:
         print(f"\n{'='*70}")
         print("✓ All breakdowns match expected distributions")
         print(f"{'='*70}\n")
+
+
+class TestPrometheusWriterRetries:
+    """Test writer retry behavior for transient remote-write failures"""
+
+    class _FakeExporter:
+        def __init__(self, outcomes):
+            self.outcomes = outcomes
+            self.calls = 0
+
+        def push_metrics(self, metrics, log_prefix, retry_count=0):
+            result = self.outcomes[self.calls] if self.calls < len(self.outcomes) else self.outcomes[-1]
+            self.calls += 1
+            return result
+
+    def test_push_with_retries_succeeds_after_failure(self):
+        exporter = self._FakeExporter([False, True])
+        writer = PrometheusWriterThread(
+            exporter=exporter,
+            write_queue=queue.Queue(),
+            max_retry_attempts=3,
+            retry_base_delay_seconds=0.0,
+            retry_max_delay_seconds=0.0,
+        )
+
+        ok = writer._push_with_retries([{'metric': 'm{}', 'value': 1, 'timestamp': 1}], 'Test')
+
+        assert ok is True
+        assert exporter.calls == 2
+
+    def test_push_with_retries_exhausts_attempts(self):
+        exporter = self._FakeExporter([False, False, False, False])
+        writer = PrometheusWriterThread(
+            exporter=exporter,
+            write_queue=queue.Queue(),
+            max_retry_attempts=2,
+            retry_base_delay_seconds=0.0,
+            retry_max_delay_seconds=0.0,
+        )
+
+        ok = writer._push_with_retries([{'metric': 'm{}', 'value': 1, 'timestamp': 1}], 'Test')
+
+        assert ok is False
+        assert exporter.calls == 3
 
 
 # ============================================================================
