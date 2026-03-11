@@ -18,7 +18,7 @@ Copilot context for this repository: [`.github/copilot-instructions.md`](.github
 Metric names are prefixed by `METRIC_PREFIX` (default: `cdn_`).
 Examples below use the `cdn_` prefix.
 
-The exporter generates 15 metrics with rich dimensional labels (stream, cdn_id, cache_status, pop, response_status, device_type, country, region):
+The exporter generates 17 metrics with rich dimensional labels (stream, cdn_id, cache_status, pop, response_status, device_type, country, region, track):
 
 ### Counters (use with `rate()` or `increase()`)
 
@@ -65,6 +65,12 @@ The exporter generates 15 metrics with rich dimensional labels (stream, cdn_id, 
 - Query top countries: `topk(10, cdn_users_by_country_total{stream="..."})`
 - Query growth rate: `rate(cdn_users_by_country_total{stream="...", country="US"}[5m])`
 
+**`cdn_users_by_resolution_total`**
+- Count of unique IP addresses per stream by track/resolution segment (counter)
+- Labels: `stream`, `track`
+- `track` parsed from path segment `tracks-vX` as `vX` (example: `tracks-v3` -> `track="v3"`)
+- Query unique users per track: `cdn_users_by_resolution_total{stream="...", track="v3"}`
+
 ### Gauges (use with `max_over_time()` or direct value)
 
 **`cdn_viewers`**
@@ -87,6 +93,12 @@ The exporter generates 15 metrics with rich dimensional labels (stream, cdn_id, 
 - Requires GeoIP database (see setup below)
 - Query top countries: `topk(10, cdn_viewers_by_country{stream="..."})`
 - Query specific country: `cdn_viewers_by_country{stream="...", country="US"}`
+
+**`cdn_viewers_by_resolution`**
+- Unique viewers by track/resolution from latest processed file/flush (gauge)
+- Labels: `stream`, `track`
+- `track` parsed from path segment `tracks-vX` as `vX` (example: `tracks-v3` -> `track="v3"`)
+- Query by track: `cdn_viewers_by_resolution{stream="...", track="v3"}`
 
 **`cdn_viewers_by_region`**
 - Unique viewers by state/region from the latest processed file/flush (gauge)
@@ -144,10 +156,18 @@ The exporter generates 15 metrics with rich dimensional labels (stream, cdn_id, 
 
 All metrics include these labels for filtering and grouping:
 - `stream` - 32-character hex stream ID extracted from path
+- `stream_name` - Legacy compatibility mirror of `stream` (temporary during migration)
 - `cdn_id` - CDN77 resource ID
 - `cache_status` - HIT, MISS, EXPIRED, etc.
 - `pop` - Edge location (e.g., "losangelesUSCA", "frankfurtDEHE")
 - `response_status` - HTTP status code (only on `cdn_responses_total`)
+
+### Legacy `stream_name` compatibility (temporary)
+
+To preserve dashboards and alerts during label migration, the exporter emits both `stream` and `stream_name` on stream-scoped series by default.
+
+- Control with `EMIT_LEGACY_STREAM_NAME_LABEL` (default: `true`)
+- Recommended plan: keep enabled through migration/backfill, then disable around June 2026 once historical `stream_name` dependence has aged out.
 
 ## Log Format
 
@@ -321,6 +341,7 @@ docker run --rm --name cdn77-exporter \
 - `PROMETHEUS_RETRY_BASE_DELAY_SECONDS` - Initial retry backoff delay (default: 1.0)
 - `PROMETHEUS_RETRY_MAX_DELAY_SECONDS` - Max retry backoff delay cap (default: 30.0)
 - `STARTUP_OFFSET_MS` - Millisecond offset added to minute-aligned samples (default: 0)
+- `EMIT_LEGACY_STREAM_NAME_LABEL` - Emit legacy `stream_name` label mirroring `stream` on stream series (default: `true`)
 - `METRIC_PREFIX` - Prefix for all emitted metric names (default: `cdn_`, e.g. `cdn_users_total`)
 - `UNMATCHED_DEVICE_LOGGING` - Enable end-of-poll logging of user agents classified as `other` (default: `true`)
 - `UNMATCHED_DEVICE_MAX_TRACKED` - Maximum unique unmatched user agents tracked in memory (default: `5000`)

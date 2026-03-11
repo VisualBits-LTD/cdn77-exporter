@@ -22,7 +22,8 @@ from exporter import (
     build_file_viewer_metrics,
     PrometheusWriterThread,
     extract_stream_id, extract_cdn_id, extract_cache_status,
-    extract_location_id, extract_response_status, extract_client_ip, extract_device_type
+    extract_location_id, extract_response_status, extract_client_ip, extract_device_type,
+    extract_track_from_path, extract_resolution_track,
 )
 
 
@@ -362,6 +363,11 @@ class TestMetricAggregation:
         viewers_country = get_metric('cdn77_viewers_by_country', ('country', 'US'))
         assert users_country['value'] == viewers_country['value']
         assert users_country['labels'] == viewers_country['labels']
+
+        users_resolution = get_metric('cdn77_users_by_resolution_total', ('track', 'v3'))
+        viewers_resolution = get_metric('cdn77_viewers_by_resolution', ('track', 'v3'))
+        assert users_resolution['value'] == viewers_resolution['value']
+        assert users_resolution['labels'] == viewers_resolution['labels']
     
     def test_ttfb_averaging(self):
         """Test time to first byte averaging"""
@@ -472,6 +478,35 @@ class TestLabelExtractors:
         )
         
         assert extract_client_ip(event) == "10.20.30.40"
+
+    def test_extract_track_from_path(self):
+        """Test parsing track label from CDN request path."""
+        assert extract_track_from_path("/99641d13e41ef47215b12671803bb13c/tracks-v3/rewind-43200.fmp4.m3u8") == "v3"
+        assert extract_track_from_path("/99641d13e41ef47215b12671803bb13c/tracks-V2/chunk.m3u8") == "v2"
+        assert extract_track_from_path("/99641d13e41ef47215b12671803bb13c/other/chunk.m3u8") == "unknown"
+
+    def test_extract_resolution_track(self):
+        """Test Event-level resolution extractor."""
+        event = Event(
+            timestamp=datetime.now(timezone.utc),
+            stream_id="99641d13e41ef47215b12671803bb13c",
+            resource_id=123,
+            cache_status="HIT",
+            response_bytes=1000,
+            time_to_first_byte_ms=100,
+            tcp_rtt_us=50000,
+            request_time_ms=150,
+            response_status=200,
+            client_country="US",
+            location_id="losangelesUSCA",
+            client_ip="10.20.30.40",
+            device_type="web",
+            raw_data={
+                "clientRequestPath": "/99641d13e41ef47215b12671803bb13c/tracks-v3/rewind-43200.fmp4.m3u8"
+            }
+        )
+
+        assert extract_resolution_track(event) == "v3"
 
 
 class TestDeviceDetection:
@@ -1327,7 +1362,9 @@ class TestFileViewerMetrics:
                 response_status=200,
                 client_country="US",
                 location_id="testPOP",
-                raw_data={},
+                raw_data={
+                    "clientRequestPath": f"/{stream_id}/tracks-v3/rewind-43200.fmp4.m3u8"
+                },
             ),
             Event(
                 timestamp=base_time,
@@ -1343,7 +1380,9 @@ class TestFileViewerMetrics:
                 response_status=200,
                 client_country="US",
                 location_id="testPOP",
-                raw_data={},
+                raw_data={
+                    "clientRequestPath": f"/{stream_id}/tracks-v3/rewind-43200.fmp4.m3u8"
+                },
             ),
             Event(
                 timestamp=base_time,
@@ -1359,7 +1398,9 @@ class TestFileViewerMetrics:
                 response_status=200,
                 client_country="US",
                 location_id="testPOP",
-                raw_data={},
+                raw_data={
+                    "clientRequestPath": f"/{stream_id}/tracks-v3/rewind-43200.fmp4.m3u8"
+                },
             ),
         ]
 
@@ -1375,12 +1416,13 @@ class TestFileViewerMetrics:
 
         metric_map = {m['metric']: m['value'] for m in metrics}
 
-        assert metric_map[f'cdn77_viewers{{stream="{stream_id}"}}'] == 2.0
-        assert metric_map[f'cdn77_viewers_by_device{{stream="{stream_id}",device_type="roku"}}'] == 1.0
-        assert metric_map[f'cdn77_viewers_by_device{{stream="{stream_id}",device_type="web"}}'] == 1.0
-        assert metric_map[f'cdn77_viewers_by_country{{stream="{stream_id}",country="US"}}'] == 2.0
-        assert metric_map[f'cdn77_viewers_by_region{{stream="{stream_id}",country="US",region="California"}}'] == 1.0
-        assert metric_map[f'cdn77_viewers_by_region{{stream="{stream_id}",country="US",region="Texas"}}'] == 1.0
+        assert metric_map[f'cdn77_viewers{{stream="{stream_id}",stream_name="{stream_id}"}}'] == 2.0
+        assert metric_map[f'cdn77_viewers_by_device{{stream="{stream_id}",stream_name="{stream_id}",device_type="roku"}}'] == 1.0
+        assert metric_map[f'cdn77_viewers_by_device{{stream="{stream_id}",stream_name="{stream_id}",device_type="web"}}'] == 1.0
+        assert metric_map[f'cdn77_viewers_by_country{{stream="{stream_id}",stream_name="{stream_id}",country="US"}}'] == 2.0
+        assert metric_map[f'cdn77_viewers_by_resolution{{stream="{stream_id}",stream_name="{stream_id}",track="v3"}}'] == 2.0
+        assert metric_map[f'cdn77_viewers_by_region{{stream="{stream_id}",stream_name="{stream_id}",country="US",region="California"}}'] == 1.0
+        assert metric_map[f'cdn77_viewers_by_region{{stream="{stream_id}",stream_name="{stream_id}",country="US",region="Texas"}}'] == 1.0
 
     def test_build_file_viewer_metrics_skips_unknown_region(self):
         event = Event(

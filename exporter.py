@@ -104,6 +104,7 @@ def minute_key_to_datetime(minute_key: str) -> datetime:
 
 UNMATCHED_DEVICE_LOGGING = _env_bool('UNMATCHED_DEVICE_LOGGING', True)
 UNMATCHED_DEVICE_MAX_TRACKED = _env_int('UNMATCHED_DEVICE_MAX_TRACKED', 5000)
+EMIT_LEGACY_STREAM_NAME_LABEL = _env_bool('EMIT_LEGACY_STREAM_NAME_LABEL', True)
 
 _unmatched_device_lock = threading.Lock()
 _unmatched_device_counts: Dict[str, int] = {}
@@ -113,6 +114,28 @@ _unmatched_device_overflow_total = 0
 def metric_name(suffix: str) -> str:
     """Build metric name with configured prefix."""
     return f"{METRIC_PREFIX}{suffix}"
+
+
+def add_legacy_stream_name_label(labels: Dict[str, str]) -> Dict[str, str]:
+    """Add legacy stream_name label mirroring stream label when enabled."""
+    if not EMIT_LEGACY_STREAM_NAME_LABEL:
+        return labels
+
+    stream = labels.get('stream')
+    if not stream:
+        return labels
+
+    compat_labels = labels.copy()
+    compat_labels.setdefault('stream_name', stream)
+    return compat_labels
+
+
+def stream_label_selector(stream: str) -> str:
+    """Build stream label selector string with optional legacy stream_name mirror."""
+    labels = [f'stream="{stream}"']
+    if EMIT_LEGACY_STREAM_NAME_LABEL:
+        labels.append(f'stream_name="{stream}"')
+    return ','.join(labels)
 
 
 def _log_unmatched_device(user_agent: str):
@@ -674,6 +697,7 @@ def build_file_viewer_metrics(
     by_stream_ips: Dict[str, Set[str]] = defaultdict(set)
     by_stream_device: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
     by_stream_country: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+    by_stream_track: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
     by_stream_region: Dict[Tuple[str, str, str], Set[str]] = defaultdict(set)
 
     for event in events:
@@ -682,6 +706,8 @@ def build_file_viewer_metrics(
 
         by_stream_ips[stream].add(ip)
         by_stream_device[(stream, event.device_type)].add(ip)
+        track = extract_resolution_track(event)
+        by_stream_track[(stream, track)].add(ip)
 
         country = event.client_country if event.client_country else "XX"
         by_stream_country[(stream, country)].add(ip)
@@ -696,28 +722,35 @@ def build_file_viewer_metrics(
 
     for stream, ips in by_stream_ips.items():
         metrics.append({
-            'metric': f'{metric_name("viewers")}{{stream="{stream}"}}',
+            'metric': f'{metric_name("viewers")}{{{stream_label_selector(stream)}}}',
             'value': float(len(ips)),
             'timestamp': timestamp_ms,
         })
 
     for (stream, device_type), ips in by_stream_device.items():
         metrics.append({
-            'metric': f'{metric_name("viewers_by_device")}{{stream="{stream}",device_type="{device_type}"}}',
+            'metric': f'{metric_name("viewers_by_device")}{{{stream_label_selector(stream)},device_type="{device_type}"}}',
             'value': float(len(ips)),
             'timestamp': timestamp_ms,
         })
 
     for (stream, country), ips in by_stream_country.items():
         metrics.append({
-            'metric': f'{metric_name("viewers_by_country")}{{stream="{stream}",country="{country}"}}',
+            'metric': f'{metric_name("viewers_by_country")}{{{stream_label_selector(stream)},country="{country}"}}',
+            'value': float(len(ips)),
+            'timestamp': timestamp_ms,
+        })
+
+    for (stream, track), ips in by_stream_track.items():
+        metrics.append({
+            'metric': f'{metric_name("viewers_by_resolution")}{{{stream_label_selector(stream)},track="{track}"}}',
             'value': float(len(ips)),
             'timestamp': timestamp_ms,
         })
 
     for (stream, country, region), ips in by_stream_region.items():
         metrics.append({
-            'metric': f'{metric_name("viewers_by_region")}{{stream="{stream}",country="{country}",region="{region}"}}',
+            'metric': f'{metric_name("viewers_by_region")}{{{stream_label_selector(stream)},country="{country}",region="{region}"}}',
             'value': float(len(ips)),
             'timestamp': timestamp_ms,
         })
@@ -854,6 +887,27 @@ def extract_device_type(event: Event) -> str:
     return event.device_type
 
 
+TRACK_RESOLUTION_PATTERN = re.compile(r'^/[a-f0-9]+/tracks-([^/]+)/')
+
+
+def extract_track_from_path(path: str) -> str:
+    """Extract normalized track label from request path, e.g. tracks-v3 -> v3."""
+    if not path:
+        return "unknown"
+
+    match = TRACK_RESOLUTION_PATTERN.match(path)
+    if not match:
+        return "unknown"
+
+    return match.group(1).strip().lower() or "unknown"
+
+
+def extract_resolution_track(event: Event) -> str:
+    """Extract track/resolution label from raw request path."""
+    path = event.raw_data.get('clientRequestPath', '') if event.raw_data else ''
+    return extract_track_from_path(path)
+
+
 # Metric definitions
 METRIC_DEFINITIONS = [
     MetricDefinition(
@@ -962,6 +1016,26 @@ METRIC_DEFINITIONS = [
             "country": extract_client_country,
         },
         help_text="Compatibility alias of cdn77_users_by_country_total"
+    ),
+    MetricDefinition(
+        name=metric_name("users_by_resolution_total"),
+        value_extractor=lambda e: e.client_ip,
+        aggregation=AggregationType.UNIQUE_COUNT,
+        labels={
+            "stream": extract_stream_id,
+            "track": extract_resolution_track,
+        },
+        help_text="Count of unique IP addresses per stream by track/resolution"
+    ),
+    MetricDefinition(
+        name=metric_name("viewers_by_resolution"),
+        value_extractor=lambda e: e.client_ip,
+        aggregation=AggregationType.UNIQUE_COUNT,
+        labels={
+            "stream": extract_stream_id,
+            "track": extract_resolution_track,
+        },
+        help_text="Compatibility alias of users_by_resolution_total"
     ),
 ]
 
@@ -1357,7 +1431,8 @@ class PrometheusExporter:
             
             # Build label string (exclude 'minute' as it's just for grouping)
             label_strs = []
-            for key, val in sorted(labels.items()):
+            output_labels = add_legacy_stream_name_label(labels)
+            for key, val in sorted(output_labels.items()):
                 if key != 'minute':
                     label_strs.append(f'{key}="{val}"')
             label_string = ','.join(label_strs)
@@ -1397,7 +1472,8 @@ class PrometheusExporter:
             
             # Build label string
             label_strs = []
-            for key, val in sorted(labels.items()):
+            output_labels = add_legacy_stream_name_label(labels)
+            for key, val in sorted(output_labels.items()):
                 label_strs.append(f'{key}="{val}"')
             label_string = ','.join(label_strs)
             
