@@ -18,7 +18,7 @@ Copilot context for this repository: [`.github/copilot-instructions.md`](.github
 Metric names are prefixed by `METRIC_PREFIX` (default: `cdn_`).
 Examples below use the `cdn_` prefix.
 
-The exporter generates 17 metrics with rich dimensional labels (stream, cdn_id, cache_status, pop, response_status, device_type, country, region, track):
+The exporter generates 22 metrics with rich dimensional labels (stream, cdn_id, cache_status, pop, response_status, device_type, country, region, track):
 
 ### Counters (use with `rate()` or `increase()`)
 
@@ -127,6 +127,21 @@ The exporter generates 17 metrics with rich dimensional labels (stream, cdn_id, 
 - Labels: `stream`, `country`, `region`, `window`
 - Requires GeoIP database (see setup below)
 - Query US states: `cdn_viewers_unique_by_region{stream="...", country="US", window="1h"}`
+
+**`cdn_watch_sessions_total`**
+- Total completed watch sessions by stream (counter)
+- Labels: `stream`
+- Query completed sessions: `increase(cdn_watch_sessions_total{stream="..."}[1h])`
+
+**`cdn_watch_time_seconds_total`**
+- Total watch time accumulated from completed sessions (counter)
+- Labels: `stream`
+- Query watch hours: `increase(cdn_watch_time_seconds_total{stream="..."}[1h]) / 3600`
+
+**`cdn_watch_session_duration_seconds_bucket`** (+`_sum`, +`_count`)
+- Histogram of completed session durations by stream
+- Labels: `stream`, `le`
+- Query p90 session duration: `histogram_quantile(0.90, sum by (stream, le) (rate(cdn_watch_session_duration_seconds_bucket[30m])))`
 
 **`cdn_time_to_first_byte_ms`**
 - Average time to first byte in milliseconds (gauge)
@@ -335,7 +350,10 @@ docker run --rm --name cdn77-exporter \
 - `POLL_INTERVAL` - Polling interval in seconds (default: 60)
 - `LOOKBACK_HOURS` - How far back to check for files (default: 2)
 - `SESSION_WINDOW_SECONDS` - Session retention horizon used for unique-window calculations (default: 7200 = 2 hours)
+- `SESSION_GAP_SECONDS` - Gap threshold to split sessions for watch-time aggregation (default: 120)
 - `UNIQUE_VIEWERS_WINDOW_SECONDS` - Window used for `cdn_viewers_unique*` metrics (default: 3600 = 1 hour)
+- `SESSION_STATE_PATH` - Optional path to persisted session tracker snapshot file (example: `/app/state/session_state.json.gz`)
+- `SESSION_STATE_SAVE_INTERVAL_SECONDS` - Background session snapshot interval in seconds (default: `300`)
 - `GEOIP_DB_PATH` - Path to MaxMind GeoLite2-City.mmdb database (optional, for geographic metrics)
 - `PROMETHEUS_RETRY_ATTEMPTS` - Retries for failed remote-write pushes in writer thread (default: 5)
 - `PROMETHEUS_RETRY_BASE_DELAY_SECONDS` - Initial retry backoff delay (default: 1.0)
@@ -366,11 +384,17 @@ To support multiple windows later (for example `1h`, `2h`, `4h`, `24h`), emit ad
 8. **Label Dimensions**: All metrics tagged with stream, cdn_id, cache_status, pop (location)
 9. **Push to Prometheus**: Batched push via remote write API (protobuf + snappy compression)
 10. **Delete & Repeat**: Removes processed file from S3, waits for next poll
+11. **Session State Persistence (optional)**: Background thread snapshots session tracker state on interval and restores on startup
 
 **Writer Retry Behavior:**
 - Remote write failures (network/DNS/5xx) are retried in the writer thread with exponential backoff.
 - Duplicate-sample `400` responses are still handled with timestamp increment retries.
 - Retry tuning is controlled via `PROMETHEUS_RETRY_*` environment variables.
+
+**Session Persistence Behavior:**
+- When `SESSION_STATE_PATH` is set, exporter restores session state from disk at startup.
+- A dedicated background thread writes compact gzip JSON snapshots every `SESSION_STATE_SAVE_INTERVAL_SECONDS` (default 5 minutes).
+- Final snapshot is also written during graceful shutdown.
 
 **Processing Flow:**
 ```

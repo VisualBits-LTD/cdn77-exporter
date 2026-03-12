@@ -9,6 +9,7 @@ import gzip
 import random
 import queue
 import os
+import tempfile
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict
 import pytest
@@ -319,8 +320,8 @@ class TestMetricAggregation:
         requests_metric = [m for m in computed if m['metric_name'] == 'cdn77_requests_total'][0]
         assert requests_metric['value'] == 50
 
-    def test_users_and_viewers_aliases_match(self):
-        """Ensure compatibility aliases emit the same values/labels as users metrics"""
+    def test_users_metrics_include_expected_breakdowns(self):
+        """Ensure users metrics include total/device/country/resolution breakdowns."""
         parser = LogParser()
         aggregator = MetricAggregator(METRIC_DEFINITIONS)
 
@@ -350,24 +351,16 @@ class TestMetricAggregation:
             return [m for m in matches if m['labels'][key] == value][0]
 
         users_total = get_metric('cdn77_users_total')
-        viewers_total = get_metric('cdn77_viewers')
-        assert users_total['value'] == viewers_total['value']
-        assert users_total['labels'] == viewers_total['labels']
+        assert users_total['value'] == 3
 
         users_device = get_metric('cdn77_users_by_device_total', ('device_type', 'roku'))
-        viewers_device = get_metric('cdn77_viewers_by_device', ('device_type', 'roku'))
-        assert users_device['value'] == viewers_device['value']
-        assert users_device['labels'] == viewers_device['labels']
+        assert users_device['value'] == 3
 
         users_country = get_metric('cdn77_users_by_country_total', ('country', 'US'))
-        viewers_country = get_metric('cdn77_viewers_by_country', ('country', 'US'))
-        assert users_country['value'] == viewers_country['value']
-        assert users_country['labels'] == viewers_country['labels']
+        assert users_country['value'] == 3
 
         users_resolution = get_metric('cdn77_users_by_resolution_total', ('track', 'v3'))
-        viewers_resolution = get_metric('cdn77_viewers_by_resolution', ('track', 'v3'))
-        assert users_resolution['value'] == viewers_resolution['value']
-        assert users_resolution['labels'] == viewers_resolution['labels']
+        assert users_resolution['value'] == 3
 
     def test_resolution_metrics_exclude_audio_tracks(self):
         """Resolution metrics should include video tracks only and skip audio tracks."""
@@ -398,7 +391,7 @@ class TestMetricAggregation:
         events = [e for e in events if e is not None]
 
         computed = aggregator.compute_final_values(aggregator.aggregate_events(events))
-        resolution_metrics = [m for m in computed if m['metric_name'] == 'cdn77_viewers_by_resolution']
+        resolution_metrics = [m for m in computed if m['metric_name'] == 'cdn77_users_by_resolution_total']
 
         assert len(resolution_metrics) == 1
         assert resolution_metrics[0]['labels']['track'] == 'v3'
@@ -1088,6 +1081,106 @@ class TestSessionTracker:
         total_metric = [m for m in metrics if m['metric_name'] == 'cdn77_viewers'][0]
         assert total_metric['value'] == 2.0
 
+    def test_watch_time_metrics_emitted_for_expired_sessions(self):
+        """Expired sessions should be rolled into watch-time counters and histogram."""
+        tracker = SessionTracker(window_seconds=3600, session_gap_seconds=1800)
+
+        stream_id = "abcd1234567890abcdef1234567890ab"
+        start = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+        end = start + timedelta(minutes=20)
+
+        tracker.update([
+            Event(
+                timestamp=start,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="web",
+                resource_id=123, cache_status="HIT", response_bytes=1000,
+                time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
+                response_status=200, client_country="US", location_id="testPOP",
+                raw_data={}
+            ),
+            Event(
+                timestamp=end,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="web",
+                resource_id=123, cache_status="HIT", response_bytes=1000,
+                time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
+                response_status=200, client_country="US", location_id="testPOP",
+                raw_data={}
+            ),
+        ])
+
+        # Force expiry to close active session and roll-up duration
+        tracker.expire_old(start + timedelta(hours=2))
+        metrics = tracker.get_watch_time_metrics(reference_time=start + timedelta(hours=2))
+
+        sessions_metric = [m for m in metrics if m['metric_name'] == 'cdn77_watch_sessions_total'][0]
+        watch_time_metric = [m for m in metrics if m['metric_name'] == 'cdn77_watch_time_seconds_total'][0]
+        p1200_bucket = [
+            m for m in metrics
+            if m['metric_name'] == 'cdn77_watch_session_duration_seconds_bucket' and m['labels']['le'] == '1200'
+        ][0]
+        inf_bucket = [
+            m for m in metrics
+            if m['metric_name'] == 'cdn77_watch_session_duration_seconds_bucket' and m['labels']['le'] == '+Inf'
+        ][0]
+
+        assert sessions_metric['value'] == 1.0
+        assert watch_time_metric['value'] == 1200.0
+        assert p1200_bucket['value'] == 1.0
+        assert inf_bucket['value'] == 1.0
+
+    def test_watch_time_metrics_split_on_session_gap(self):
+        """A large gap for the same IP should close prior session and start a new one."""
+        tracker = SessionTracker(window_seconds=7200, session_gap_seconds=120)
+
+        stream_id = "abcd1234567890abcdef1234567890ab"
+        t0 = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+        t1 = t0 + timedelta(seconds=30)
+        t2 = t0 + timedelta(minutes=10)
+
+        tracker.update([
+            Event(
+                timestamp=t0,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="web",
+                resource_id=123, cache_status="HIT", response_bytes=1000,
+                time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
+                response_status=200, client_country="US", location_id="testPOP",
+                raw_data={}
+            ),
+            Event(
+                timestamp=t1,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="web",
+                resource_id=123, cache_status="HIT", response_bytes=1000,
+                time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
+                response_status=200, client_country="US", location_id="testPOP",
+                raw_data={}
+            ),
+            Event(
+                timestamp=t2,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="web",
+                resource_id=123, cache_status="HIT", response_bytes=1000,
+                time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
+                response_status=200, client_country="US", location_id="testPOP",
+                raw_data={}
+            ),
+        ])
+
+        metrics = tracker.get_watch_time_metrics(reference_time=t2)
+        sessions_metric = [m for m in metrics if m['metric_name'] == 'cdn77_watch_sessions_total'][0]
+        watch_time_metric = [m for m in metrics if m['metric_name'] == 'cdn77_watch_time_seconds_total'][0]
+
+        assert sessions_metric['value'] == 1.0
+        assert watch_time_metric['value'] == 30.0
+
     def test_region_metrics_use_geoip_when_region_missing(self):
         """Region gauges should use GeoIP lookup when event only has country code."""
         tracker = SessionTracker(window_seconds=300)
@@ -1180,6 +1273,92 @@ class TestSessionTracker:
         assert first == ("US", "California")
         assert second == ("US", "California")
         assert fake_reader.calls == 1
+
+    def test_session_state_persist_and_restore_roundtrip(self):
+        """Session tracker state should round-trip through persisted snapshot file."""
+        tracker = SessionTracker(window_seconds=7200)
+        now = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+        stream_id = "abcd1234567890abcdef1234567890ab"
+
+        events = [
+            Event(
+                timestamp=now,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="testPOP",
+                raw_data={},
+            ),
+            Event(
+                timestamp=now,
+                stream_id=stream_id,
+                client_ip="10.0.0.2",
+                device_type="roku",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="testPOP",
+                raw_data={},
+            ),
+        ]
+        tracker.update(events)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            snapshot_path = os.path.join(tmp_dir, "session_state.json.gz")
+            assert tracker.persist_to_file(snapshot_path, reference_time=now)
+
+            restored = SessionTracker(window_seconds=7200)
+            count = restored.restore_from_file(snapshot_path, reference_time=now)
+
+            assert count == 2
+            stats = restored.get_stats()
+            assert stats['total_sessions'] == 2
+            assert stats['streams'] == 1
+
+    def test_session_state_restore_expires_old_entries(self):
+        """Restored session snapshots should drop entries outside tracker window."""
+        tracker = SessionTracker(window_seconds=3600)
+        base_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+
+        tracker.update([
+            Event(
+                timestamp=base_time - timedelta(minutes=120),
+                stream_id="abcd1234567890abcdef1234567890ab",
+                client_ip="10.0.0.9",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="testPOP",
+                raw_data={},
+            )
+        ])
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            snapshot_path = os.path.join(tmp_dir, "session_state.json.gz")
+            assert tracker.persist_to_file(snapshot_path, reference_time=base_time)
+
+            restored = SessionTracker(window_seconds=3600)
+            count = restored.restore_from_file(snapshot_path, reference_time=base_time)
+            assert count == 0
 
     def test_region_metric_has_expected_labels(self):
         """Region metric should include stream/country/region labels."""

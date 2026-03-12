@@ -328,6 +328,7 @@ class EventBuffer:
 @dataclass
 class SessionInfo:
     """Information about an IP session"""
+    first_seen: datetime
     last_seen: datetime
     device_type: str
     country: str
@@ -342,7 +343,12 @@ class SessionTracker:
     Generates gauge metrics representing unique viewers in the window.
     """
     
-    def __init__(self, window_seconds: int = 7200, geoip_db_path: Optional[str] = None):
+    def __init__(
+        self,
+        window_seconds: int = 7200,
+        geoip_db_path: Optional[str] = None,
+        session_gap_seconds: int = 120,
+    ):
         """
         Initialize session tracker
         
@@ -351,6 +357,8 @@ class SessionTracker:
             geoip_db_path: Path to MaxMind GeoIP2 database file (optional)
         """
         self.window = timedelta(seconds=window_seconds)
+        self.session_gap_seconds = max(1, session_gap_seconds)
+        self.watch_time_buckets_seconds: Tuple[int, ...] = (60, 180, 300, 600, 1200, 1800, 3600, 7200)
         
         # Store: {stream_id: {ip_address: SessionInfo}}
         self.sessions: Dict[str, Dict[str, SessionInfo]] = defaultdict(dict)
@@ -359,6 +367,11 @@ class SessionTracker:
         self._geo_warning_count = 0
         self._geo_warning_limit = 25
         self._geo_reader_missing_logged = False
+        self._watch_sessions_total: Dict[str, int] = defaultdict(int)
+        self._watch_time_seconds_total: Dict[str, float] = defaultdict(float)
+        self._watch_duration_sum: Dict[str, float] = defaultdict(float)
+        self._watch_duration_count: Dict[str, int] = defaultdict(int)
+        self._watch_duration_bucket_counts: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
         
         # GeoIP lookup
         self.geoip_reader = None
@@ -385,6 +398,18 @@ class SessionTracker:
             self._geo_warning_count += 1
             if self._geo_warning_count == self._geo_warning_limit:
                 logger.warning("GeoIP warning log limit reached; suppressing further per-IP warnings")
+
+    def _record_closed_session(self, stream_id: str, session: SessionInfo):
+        """Aggregate watch-time metrics for a closed session."""
+        duration_seconds = max(0.0, (session.last_seen - session.first_seen).total_seconds())
+
+        self._watch_sessions_total[stream_id] += 1
+        self._watch_time_seconds_total[stream_id] += duration_seconds
+        self._watch_duration_sum[stream_id] += duration_seconds
+        self._watch_duration_count[stream_id] += 1
+        for bucket in self.watch_time_buckets_seconds:
+            if duration_seconds <= bucket:
+                self._watch_duration_bucket_counts[stream_id][bucket] += 1
 
     def lookup_geo(self, ip_address: str) -> Tuple[str, str]:
         """
@@ -453,14 +478,37 @@ class SessionTracker:
                 # Update or create session info
                 current_session = self.sessions[event.stream_id].get(event.client_ip)
                 
-                if current_session is None or event.timestamp > current_session.last_seen:
-                    # New session or more recent timestamp
+                if current_session is None:
                     self.sessions[event.stream_id][event.client_ip] = SessionInfo(
+                        first_seen=event.timestamp,
                         last_seen=event.timestamp,
                         device_type=event.device_type,
                         country=country,
                         region=region
                     )
+                    continue
+
+                # Ignore out-of-order older events for session timing updates
+                if event.timestamp <= current_session.last_seen:
+                    continue
+
+                gap_seconds = (event.timestamp - current_session.last_seen).total_seconds()
+                if gap_seconds > self.session_gap_seconds:
+                    # Previous session closed, start a new one for this IP
+                    self._record_closed_session(event.stream_id, current_session)
+                    self.sessions[event.stream_id][event.client_ip] = SessionInfo(
+                        first_seen=event.timestamp,
+                        last_seen=event.timestamp,
+                        device_type=event.device_type,
+                        country=country,
+                        region=region,
+                    )
+                else:
+                    # Continue current session
+                    current_session.last_seen = event.timestamp
+                    current_session.device_type = event.device_type
+                    current_session.country = country
+                    current_session.region = region
     
     def expire_old(self, reference_time: datetime):
         """
@@ -479,6 +527,7 @@ class SessionTracker:
                 ]
                 
                 for ip in expired_ips:
+                    self._record_closed_session(stream_id, self.sessions[stream_id][ip])
                     del self.sessions[stream_id][ip]
                 
                 # Remove empty streams
@@ -576,6 +625,59 @@ class SessionTracker:
                     skipped_unknown_region_series,
                 )
             
+            return metrics
+
+    def get_watch_time_metrics(
+        self,
+        reference_time: Optional[datetime] = None,
+        batch_offset_ms: int = 0,
+    ) -> List[Dict]:
+        """Return aggregate watch-time counters/histogram metrics by stream."""
+        with self._lock:
+            reference_dt = floor_to_minute(reference_time or datetime.now(timezone.utc))
+            timestamp_ms = int(reference_dt.timestamp() * 1000) + batch_offset_ms
+            metrics: List[Dict] = []
+
+            for stream_id, sessions_total in self._watch_sessions_total.items():
+                metrics.append({
+                    'metric_name': metric_name('watch_sessions_total'),
+                    'value': float(sessions_total),
+                    'timestamp_ms': timestamp_ms,
+                    'labels': {'stream': stream_id},
+                })
+                metrics.append({
+                    'metric_name': metric_name('watch_time_seconds_total'),
+                    'value': float(self._watch_time_seconds_total.get(stream_id, 0.0)),
+                    'timestamp_ms': timestamp_ms,
+                    'labels': {'stream': stream_id},
+                })
+                metrics.append({
+                    'metric_name': metric_name('watch_session_duration_seconds_sum'),
+                    'value': float(self._watch_duration_sum.get(stream_id, 0.0)),
+                    'timestamp_ms': timestamp_ms,
+                    'labels': {'stream': stream_id},
+                })
+                metrics.append({
+                    'metric_name': metric_name('watch_session_duration_seconds_count'),
+                    'value': float(self._watch_duration_count.get(stream_id, 0)),
+                    'timestamp_ms': timestamp_ms,
+                    'labels': {'stream': stream_id},
+                })
+
+                for bucket in self.watch_time_buckets_seconds:
+                    metrics.append({
+                        'metric_name': metric_name('watch_session_duration_seconds_bucket'),
+                        'value': float(self._watch_duration_bucket_counts[stream_id].get(bucket, 0)),
+                        'timestamp_ms': timestamp_ms,
+                        'labels': {'stream': stream_id, 'le': str(bucket)},
+                    })
+                metrics.append({
+                    'metric_name': metric_name('watch_session_duration_seconds_bucket'),
+                    'value': float(self._watch_duration_count.get(stream_id, 0)),
+                    'timestamp_ms': timestamp_ms,
+                    'labels': {'stream': stream_id, 'le': '+Inf'},
+                })
+
             return metrics
 
     def get_unique_metrics(
@@ -683,6 +785,130 @@ class SessionTracker:
                 'streams': total_streams,
                 'total_sessions': total_sessions
             }
+
+    def snapshot_rows(self) -> List[List[Any]]:
+        """Return compact snapshot rows for persistence."""
+        with self._lock:
+            rows: List[List[Any]] = []
+            for stream_id, sessions in self.sessions.items():
+                for ip_address, session in sessions.items():
+                    rows.append([
+                        stream_id,
+                        ip_address,
+                        int(session.first_seen.timestamp()),
+                        int(session.last_seen.timestamp()),
+                        session.device_type,
+                        session.country,
+                        session.region,
+                    ])
+            return rows
+
+    def persist_to_file(self, file_path: str, reference_time: Optional[datetime] = None) -> bool:
+        """Persist session state to compressed JSON snapshot atomically."""
+        try:
+            reference_dt = reference_time or datetime.now(timezone.utc)
+            self.expire_old(reference_dt)
+            rows = self.snapshot_rows()
+
+            target = Path(file_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = target.with_suffix(f"{target.suffix}.tmp")
+
+            with self._lock:
+                watch_payload = {
+                    'sessions_total': dict(self._watch_sessions_total),
+                    'time_seconds_total': dict(self._watch_time_seconds_total),
+                    'duration_sum': dict(self._watch_duration_sum),
+                    'duration_count': dict(self._watch_duration_count),
+                    'duration_bucket_counts': {
+                        stream_id: {str(bucket): count for bucket, count in buckets.items()}
+                        for stream_id, buckets in self._watch_duration_bucket_counts.items()
+                    },
+                }
+
+            payload = {
+                'version': 2,
+                'saved_at': reference_dt.isoformat(),
+                'window_seconds': int(self.window.total_seconds()),
+                'session_gap_seconds': self.session_gap_seconds,
+                'rows': rows,
+                'watch': watch_payload,
+            }
+
+            with gzip.open(temp_path, 'wt', encoding='utf-8') as fp:
+                json.dump(payload, fp, separators=(',', ':'))
+
+            os.replace(temp_path, target)
+            logger.info("Persisted session tracker state: %d sessions -> %s", len(rows), file_path)
+            return True
+        except Exception as exc:
+            logger.error("Failed to persist session tracker state to %s: %s", file_path, exc)
+            return False
+
+    def restore_from_file(self, file_path: str, reference_time: Optional[datetime] = None) -> int:
+        """Restore session state from compressed JSON snapshot, returning loaded session count."""
+        target = Path(file_path)
+        if not target.exists():
+            logger.info("Session tracker state file not found, starting fresh: %s", file_path)
+            return 0
+
+        try:
+            with gzip.open(target, 'rt', encoding='utf-8') as fp:
+                payload = json.load(fp)
+
+            rows = payload.get('rows', [])
+            restored: Dict[str, Dict[str, SessionInfo]] = defaultdict(dict)
+            for row in rows:
+                if not isinstance(row, list) or len(row) not in (6, 7):
+                    continue
+                if len(row) == 7:
+                    stream_id, ip_address, first_seen_epoch, last_seen_epoch, device_type, country, region = row
+                    first_seen = datetime.fromtimestamp(int(first_seen_epoch), tz=timezone.utc)
+                else:
+                    stream_id, ip_address, last_seen_epoch, device_type, country, region = row
+                    first_seen = datetime.fromtimestamp(int(last_seen_epoch), tz=timezone.utc)
+                last_seen = datetime.fromtimestamp(int(last_seen_epoch), tz=timezone.utc)
+                restored[str(stream_id)][str(ip_address)] = SessionInfo(
+                    first_seen=first_seen,
+                    last_seen=last_seen,
+                    device_type=str(device_type),
+                    country=str(country),
+                    region=str(region),
+                )
+
+            watch_payload = payload.get('watch', {}) if isinstance(payload, dict) else {}
+            restored_watch_sessions_total = defaultdict(int, {
+                str(k): int(v) for k, v in watch_payload.get('sessions_total', {}).items()
+            })
+            restored_watch_time_total = defaultdict(float, {
+                str(k): float(v) for k, v in watch_payload.get('time_seconds_total', {}).items()
+            })
+            restored_watch_duration_sum = defaultdict(float, {
+                str(k): float(v) for k, v in watch_payload.get('duration_sum', {}).items()
+            })
+            restored_watch_duration_count = defaultdict(int, {
+                str(k): int(v) for k, v in watch_payload.get('duration_count', {}).items()
+            })
+            restored_watch_buckets: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+            for stream_id, buckets in watch_payload.get('duration_bucket_counts', {}).items():
+                for bucket, count in buckets.items():
+                    restored_watch_buckets[str(stream_id)][int(bucket)] = int(count)
+
+            with self._lock:
+                self.sessions = restored
+                self._watch_sessions_total = restored_watch_sessions_total
+                self._watch_time_seconds_total = restored_watch_time_total
+                self._watch_duration_sum = restored_watch_duration_sum
+                self._watch_duration_count = restored_watch_duration_count
+                self._watch_duration_bucket_counts = restored_watch_buckets
+
+            self.expire_old(reference_time or datetime.now(timezone.utc))
+            loaded_count = self.get_stats()['total_sessions']
+            logger.info("Restored session tracker state: %d sessions from %s", loaded_count, file_path)
+            return loaded_count
+        except Exception as exc:
+            logger.error("Failed to restore session tracker state from %s: %s", file_path, exc)
+            return 0
 
 
 def build_file_viewer_metrics(
@@ -977,15 +1203,6 @@ METRIC_DEFINITIONS = [
         help_text="Count of unique IP addresses per stream"
     ),
     MetricDefinition(
-        name=metric_name("viewers"),
-        value_extractor=lambda e: e.client_ip,  # Compatibility alias for users metric
-        aggregation=AggregationType.UNIQUE_COUNT,
-        labels={
-            "stream": extract_stream_id,
-        },
-        help_text="Compatibility alias of cdn77_users_total"
-    ),
-    MetricDefinition(
         name=metric_name("users_by_device_total"),
         value_extractor=lambda e: e.client_ip,  # Value is the IP address itself
         aggregation=AggregationType.UNIQUE_COUNT,
@@ -994,16 +1211,6 @@ METRIC_DEFINITIONS = [
             "device_type": extract_device_type,
         },
         help_text="Count of unique IP addresses per stream by device type"
-    ),
-    MetricDefinition(
-        name=metric_name("viewers_by_device"),
-        value_extractor=lambda e: e.client_ip,  # Compatibility alias for users metric
-        aggregation=AggregationType.UNIQUE_COUNT,
-        labels={
-            "stream": extract_stream_id,
-            "device_type": extract_device_type,
-        },
-        help_text="Compatibility alias of cdn77_users_by_device_total"
     ),
     MetricDefinition(
         name=metric_name("users_by_country_total"),
@@ -1016,16 +1223,6 @@ METRIC_DEFINITIONS = [
         help_text="Count of unique IP addresses per stream by country"
     ),
     MetricDefinition(
-        name=metric_name("viewers_by_country"),
-        value_extractor=lambda e: e.client_ip,  # Compatibility alias for users metric
-        aggregation=AggregationType.UNIQUE_COUNT,
-        labels={
-            "stream": extract_stream_id,
-            "country": extract_client_country,
-        },
-        help_text="Compatibility alias of cdn77_users_by_country_total"
-    ),
-    MetricDefinition(
         name=metric_name("users_by_resolution_total"),
         value_extractor=lambda e: e.client_ip if is_video_track(extract_resolution_track(e)) else None,
         aggregation=AggregationType.UNIQUE_COUNT,
@@ -1034,16 +1231,6 @@ METRIC_DEFINITIONS = [
             "track": extract_resolution_track,
         },
         help_text="Count of unique IP addresses per stream by track/resolution"
-    ),
-    MetricDefinition(
-        name=metric_name("viewers_by_resolution"),
-        value_extractor=lambda e: e.client_ip if is_video_track(extract_resolution_track(e)) else None,
-        aggregation=AggregationType.UNIQUE_COUNT,
-        labels={
-            "stream": extract_stream_id,
-            "track": extract_resolution_track,
-        },
-        help_text="Compatibility alias of users_by_resolution_total"
     ),
 ]
 
@@ -1676,6 +1863,41 @@ class PrometheusWriterThread(threading.Thread):
         self.write_queue.put(None)
 
 
+class SessionStatePersistenceThread(threading.Thread):
+    """Background thread for periodic session tracker state persistence."""
+
+    def __init__(
+        self,
+        tracker: SessionTracker,
+        state_path: str,
+        save_interval_seconds: int = 300,
+    ):
+        super().__init__(daemon=True, name="SessionStatePersistence")
+        self.tracker = tracker
+        self.state_path = state_path
+        self.save_interval_seconds = max(5, save_interval_seconds)
+        self._stop_event = threading.Event()
+
+    def persist_once(self) -> bool:
+        """Persist session state one time."""
+        return self.tracker.persist_to_file(self.state_path)
+
+    def run(self):
+        logger.info(
+            "Session state persistence thread started (interval=%ss, path=%s)",
+            self.save_interval_seconds,
+            self.state_path,
+        )
+        while not self._stop_event.wait(self.save_interval_seconds):
+            self.persist_once()
+
+        logger.info("Session state persistence thread stopped")
+
+    def stop(self):
+        """Request thread stop."""
+        self._stop_event.set()
+
+
 class S3Importer:
     """Main S3 log importer - processes events with buffering for overlaps"""
     
@@ -1725,6 +1947,7 @@ class S3Importer:
         self.unique_viewers_window_label = _duration_label_from_seconds(self.unique_viewers_window_seconds)
 
         configured_session_window_seconds = _env_int('SESSION_WINDOW_SECONDS', 7200)
+        self.session_gap_seconds = _env_int('SESSION_GAP_SECONDS', 120)
         self.viewers_window_seconds = max(configured_session_window_seconds, self.unique_viewers_window_seconds)
         if configured_session_window_seconds < self.unique_viewers_window_seconds:
             logger.warning(
@@ -1739,7 +1962,22 @@ class S3Importer:
         self.session_tracker = SessionTracker(
             window_seconds=self.viewers_window_seconds,
             geoip_db_path=self.geoip_db_path,
+            session_gap_seconds=self.session_gap_seconds,
         )
+        self.session_state_path = os.getenv('SESSION_STATE_PATH', '').strip()
+        self.session_state_save_interval_seconds = _env_int('SESSION_STATE_SAVE_INTERVAL_SECONDS', 300)
+        self.session_state_thread: Optional[SessionStatePersistenceThread] = None
+
+        if self.session_state_path:
+            self.session_tracker.restore_from_file(self.session_state_path)
+            self.session_state_thread = SessionStatePersistenceThread(
+                tracker=self.session_tracker,
+                state_path=self.session_state_path,
+                save_interval_seconds=self.session_state_save_interval_seconds,
+            )
+            self.session_state_thread.start()
+        else:
+            logger.info("SESSION_STATE_PATH not set; session tracker state persistence is disabled")
         
         # Start writer thread
         self.writer_thread = PrometheusWriterThread(
@@ -1783,8 +2021,8 @@ class S3Importer:
         if keys_to_remove:
             logger.info(f"Cleaned up {len(keys_to_remove)} old flush count entries")
         
-        # Flush each minute separately with batch offset
-        total_metrics = 0
+        # Build consolidated flush payload with per-minute offsets
+        consolidated_metrics: List[Dict] = []
         file_viewer_metrics: List[Dict] = []
         for minute_key in sorted(events_by_minute.keys()):
             minute_events = events_by_minute[minute_key]
@@ -1818,12 +2056,8 @@ class S3Importer:
             
             if metrics:
                 offset_str = f" [+{batch_offset_ms}ms offset]" if batch_offset_ms > 0 else ""
-                logger.info(f"Flushing {len(metrics)} metrics for minute {minute_key} ({len(minute_events)} events){offset_str}")
-                try:
-                    self.write_queue.put((metrics, source), timeout=5.0)
-                    total_metrics += len(metrics)
-                except queue.Full:
-                    logger.error(f"Queue full! Dropping {len(metrics)} metrics for minute {minute_key}")
+                logger.info(f"Built {len(metrics)} metrics for minute {minute_key} ({len(minute_events)} events){offset_str}")
+                consolidated_metrics.extend(metrics)
 
             minute_viewer_metrics = build_file_viewer_metrics(
                 minute_events,
@@ -1832,12 +2066,14 @@ class S3Importer:
             )
             file_viewer_metrics.extend(minute_viewer_metrics)
 
-        # Emit per-file viewer metrics with minute-aligned timestamps
-        if file_viewer_metrics:
+        consolidated_metrics.extend(file_viewer_metrics)
+
+        if consolidated_metrics:
             try:
-                self.write_queue.put((file_viewer_metrics, f"{source}-Viewers"), timeout=5.0)
+                self.write_queue.put((consolidated_metrics, source), timeout=5.0)
+                logger.info(f"Queued consolidated flush payload: {len(consolidated_metrics)} metrics from {source}")
             except queue.Full:
-                logger.error(f"Queue full! Dropping {len(file_viewer_metrics)} file viewer metrics")
+                logger.error(f"Queue full! Dropping {len(consolidated_metrics)} consolidated metrics from {source}")
     
     def _check_and_flush_buffer(self):
         """Flush all buffered events immediately (batch offsets prevent duplicates)"""
@@ -2002,7 +2238,11 @@ class S3Importer:
             reference_time=unique_reference_time,
             batch_offset_ms=self.startup_offset_ms,
         )
-        unique_gauge_metrics = self.exporter.build_gauge_metrics(unique_gauge_data)
+        watch_time_data = self.session_tracker.get_watch_time_metrics(
+            reference_time=unique_reference_time,
+            batch_offset_ms=self.startup_offset_ms,
+        )
+        unique_gauge_metrics = self.exporter.build_gauge_metrics(unique_gauge_data + watch_time_data)
         if unique_gauge_metrics:
             try:
                 self.write_queue.put((unique_gauge_metrics, "UniqueSessionGauges"), timeout=5.0)
@@ -2067,6 +2307,15 @@ class S3Importer:
         """Graceful shutdown - waits for writer thread to flush all pending metrics"""
         logger.info("Shutdown requested - stopping new file processing...")
         self.shutdown_requested = True
+
+        if self.session_state_thread:
+            logger.info("Stopping session state persistence thread...")
+            self.session_state_thread.stop()
+            self.session_state_thread.join(timeout=10)
+
+        if self.session_state_path:
+            logger.info("Persisting final session tracker snapshot...")
+            self.session_tracker.persist_to_file(self.session_state_path)
         
         # Final buffer flush (flush everything regardless of age)
         all_events = self.event_buffer.get_and_clear()
