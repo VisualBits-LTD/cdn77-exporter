@@ -86,6 +86,19 @@ def _duration_label_from_seconds(seconds: int) -> str:
     return f"{seconds}s"
 
 
+def _watch_band_label(duration_seconds: float) -> str:
+    """Map watch duration to a coarse product-facing band label."""
+    if duration_seconds <= 60:
+        return "0_1m"
+    if duration_seconds <= 300:
+        return "1_5m"
+    if duration_seconds <= 1200:
+        return "5_20m"
+    if duration_seconds <= 3600:
+        return "20_60m"
+    return "60m_plus"
+
+
 def floor_to_minute(dt: datetime) -> datetime:
     """Round datetime down to minute boundary in UTC."""
     return dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
@@ -333,6 +346,7 @@ class SessionInfo:
     device_type: str
     country: str
     region: str  # State/province
+    watch_session_closed: bool = False
 
 
 class SessionTracker:
@@ -372,6 +386,7 @@ class SessionTracker:
         self._watch_duration_sum: Dict[str, float] = defaultdict(float)
         self._watch_duration_count: Dict[str, int] = defaultdict(int)
         self._watch_duration_bucket_counts: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        self._watch_duration_band_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
         
         # GeoIP lookup
         self.geoip_reader = None
@@ -402,14 +417,27 @@ class SessionTracker:
     def _record_closed_session(self, stream_id: str, session: SessionInfo):
         """Aggregate watch-time metrics for a closed session."""
         duration_seconds = max(0.0, (session.last_seen - session.first_seen).total_seconds())
+        duration_band = _watch_band_label(duration_seconds)
 
         self._watch_sessions_total[stream_id] += 1
         self._watch_time_seconds_total[stream_id] += duration_seconds
         self._watch_duration_sum[stream_id] += duration_seconds
         self._watch_duration_count[stream_id] += 1
+        self._watch_duration_band_counts[stream_id][duration_band] += 1
         for bucket in self.watch_time_buckets_seconds:
             if duration_seconds <= bucket:
                 self._watch_duration_bucket_counts[stream_id][bucket] += 1
+
+    def _close_idle_watch_sessions_locked(self, reference_time: datetime):
+        """Close sessions idle longer than session_gap_seconds for watch-time accounting."""
+        idle_cutoff = reference_time - timedelta(seconds=self.session_gap_seconds)
+        for stream_id, sessions in self.sessions.items():
+            for session in sessions.values():
+                if session.watch_session_closed:
+                    continue
+                if session.last_seen < idle_cutoff:
+                    self._record_closed_session(stream_id, session)
+                    session.watch_session_closed = True
 
     def lookup_geo(self, ip_address: str) -> Tuple[str, str]:
         """
@@ -484,7 +512,7 @@ class SessionTracker:
                         last_seen=event.timestamp,
                         device_type=event.device_type,
                         country=country,
-                        region=region
+                        region=region,
                     )
                     continue
 
@@ -495,7 +523,8 @@ class SessionTracker:
                 gap_seconds = (event.timestamp - current_session.last_seen).total_seconds()
                 if gap_seconds > self.session_gap_seconds:
                     # Previous session closed, start a new one for this IP
-                    self._record_closed_session(event.stream_id, current_session)
+                    if not current_session.watch_session_closed:
+                        self._record_closed_session(event.stream_id, current_session)
                     self.sessions[event.stream_id][event.client_ip] = SessionInfo(
                         first_seen=event.timestamp,
                         last_seen=event.timestamp,
@@ -504,11 +533,21 @@ class SessionTracker:
                         region=region,
                     )
                 else:
-                    # Continue current session
-                    current_session.last_seen = event.timestamp
-                    current_session.device_type = event.device_type
-                    current_session.country = country
-                    current_session.region = region
+                    if current_session.watch_session_closed:
+                        # Session was previously closed due idle timeout; start fresh.
+                        self.sessions[event.stream_id][event.client_ip] = SessionInfo(
+                            first_seen=event.timestamp,
+                            last_seen=event.timestamp,
+                            device_type=event.device_type,
+                            country=country,
+                            region=region,
+                        )
+                    else:
+                        # Continue current session
+                        current_session.last_seen = event.timestamp
+                        current_session.device_type = event.device_type
+                        current_session.country = country
+                        current_session.region = region
     
     def expire_old(self, reference_time: datetime):
         """
@@ -520,6 +559,7 @@ class SessionTracker:
         cutoff = reference_time - self.window
         
         with self._lock:
+            self._close_idle_watch_sessions_locked(reference_time)
             for stream_id in list(self.sessions.keys()):
                 expired_ips = [
                     ip for ip, session in self.sessions[stream_id].items()
@@ -527,7 +567,9 @@ class SessionTracker:
                 ]
                 
                 for ip in expired_ips:
-                    self._record_closed_session(stream_id, self.sessions[stream_id][ip])
+                    session = self.sessions[stream_id][ip]
+                    if not session.watch_session_closed:
+                        self._record_closed_session(stream_id, session)
                     del self.sessions[stream_id][ip]
                 
                 # Remove empty streams
@@ -635,6 +677,7 @@ class SessionTracker:
         """Return aggregate watch-time counters/histogram metrics by stream."""
         with self._lock:
             reference_dt = floor_to_minute(reference_time or datetime.now(timezone.utc))
+            self._close_idle_watch_sessions_locked(reference_dt)
             timestamp_ms = int(reference_dt.timestamp() * 1000) + batch_offset_ms
             metrics: List[Dict] = []
 
@@ -663,6 +706,14 @@ class SessionTracker:
                     'timestamp_ms': timestamp_ms,
                     'labels': {'stream': stream_id},
                 })
+
+                for band in ('0_1m', '1_5m', '5_20m', '20_60m', '60m_plus'):
+                    metrics.append({
+                        'metric_name': metric_name('watch_session_duration_band_total'),
+                        'value': float(self._watch_duration_band_counts[stream_id].get(band, 0)),
+                        'timestamp_ms': timestamp_ms,
+                        'labels': {'stream': stream_id, 'band': band},
+                    })
 
                 for bucket in self.watch_time_buckets_seconds:
                     metrics.append({
@@ -800,6 +851,7 @@ class SessionTracker:
                         session.device_type,
                         session.country,
                         session.region,
+                        bool(session.watch_session_closed),
                     ])
             return rows
 
@@ -820,6 +872,10 @@ class SessionTracker:
                     'time_seconds_total': dict(self._watch_time_seconds_total),
                     'duration_sum': dict(self._watch_duration_sum),
                     'duration_count': dict(self._watch_duration_count),
+                    'duration_band_counts': {
+                        stream_id: dict(bands)
+                        for stream_id, bands in self._watch_duration_band_counts.items()
+                    },
                     'duration_bucket_counts': {
                         stream_id: {str(bucket): count for bucket, count in buckets.items()}
                         for stream_id, buckets in self._watch_duration_bucket_counts.items()
@@ -859,14 +915,19 @@ class SessionTracker:
             rows = payload.get('rows', [])
             restored: Dict[str, Dict[str, SessionInfo]] = defaultdict(dict)
             for row in rows:
-                if not isinstance(row, list) or len(row) not in (6, 7):
+                if not isinstance(row, list) or len(row) not in (6, 7, 8):
                     continue
-                if len(row) == 7:
+                if len(row) == 8:
+                    stream_id, ip_address, first_seen_epoch, last_seen_epoch, device_type, country, region, watch_session_closed = row
+                    first_seen = datetime.fromtimestamp(int(first_seen_epoch), tz=timezone.utc)
+                elif len(row) == 7:
                     stream_id, ip_address, first_seen_epoch, last_seen_epoch, device_type, country, region = row
                     first_seen = datetime.fromtimestamp(int(first_seen_epoch), tz=timezone.utc)
+                    watch_session_closed = False
                 else:
                     stream_id, ip_address, last_seen_epoch, device_type, country, region = row
                     first_seen = datetime.fromtimestamp(int(last_seen_epoch), tz=timezone.utc)
+                    watch_session_closed = False
                 last_seen = datetime.fromtimestamp(int(last_seen_epoch), tz=timezone.utc)
                 restored[str(stream_id)][str(ip_address)] = SessionInfo(
                     first_seen=first_seen,
@@ -874,6 +935,7 @@ class SessionTracker:
                     device_type=str(device_type),
                     country=str(country),
                     region=str(region),
+                    watch_session_closed=bool(watch_session_closed),
                 )
 
             watch_payload = payload.get('watch', {}) if isinstance(payload, dict) else {}
@@ -889,6 +951,10 @@ class SessionTracker:
             restored_watch_duration_count = defaultdict(int, {
                 str(k): int(v) for k, v in watch_payload.get('duration_count', {}).items()
             })
+            restored_watch_bands: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+            for stream_id, bands in watch_payload.get('duration_band_counts', {}).items():
+                for band, count in bands.items():
+                    restored_watch_bands[str(stream_id)][str(band)] = int(count)
             restored_watch_buckets: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
             for stream_id, buckets in watch_payload.get('duration_bucket_counts', {}).items():
                 for bucket, count in buckets.items():
@@ -900,6 +966,7 @@ class SessionTracker:
                 self._watch_time_seconds_total = restored_watch_time_total
                 self._watch_duration_sum = restored_watch_duration_sum
                 self._watch_duration_count = restored_watch_duration_count
+                self._watch_duration_band_counts = restored_watch_bands
                 self._watch_duration_bucket_counts = restored_watch_buckets
 
             self.expire_old(reference_time or datetime.now(timezone.utc))

@@ -131,6 +131,7 @@ The exporter generates 22 metrics with rich dimensional labels (stream, cdn_id, 
 **`cdn_watch_sessions_total`**
 - Total completed watch sessions by stream (counter)
 - Labels: `stream`
+- Sessions close after `SESSION_GAP_SECONDS` of inactivity (or on hard expiry)
 - Query completed sessions: `increase(cdn_watch_sessions_total{stream="..."}[1h])`
 
 **`cdn_watch_time_seconds_total`**
@@ -142,6 +143,12 @@ The exporter generates 22 metrics with rich dimensional labels (stream, cdn_id, 
 - Histogram of completed session durations by stream
 - Labels: `stream`, `le`
 - Query p90 session duration: `histogram_quantile(0.90, sum by (stream, le) (rate(cdn_watch_session_duration_seconds_bucket[30m])))`
+
+**`cdn_watch_session_duration_band_total`**
+- Product-friendly session duration band totals by stream (counter)
+- Labels: `stream`, `band` (`0_1m`, `1_5m`, `5_20m`, `20_60m`, `60m_plus`)
+- Query engagement mix: `sum by (stream, band) (increase(cdn_watch_session_duration_band_total[1h]))`
+- Query short-session ratio: `sum(increase(cdn_watch_session_duration_band_total{band="0_1m"}[1h])) / sum(increase(cdn_watch_sessions_total[1h]))`
 
 **`cdn_time_to_first_byte_ms`**
 - Average time to first byte in milliseconds (gauge)
@@ -351,6 +358,7 @@ docker run --rm --name cdn77-exporter \
 - `LOOKBACK_HOURS` - How far back to check for files (default: 2)
 - `SESSION_WINDOW_SECONDS` - Session retention horizon used for unique-window calculations (default: 7200 = 2 hours)
 - `SESSION_GAP_SECONDS` - Gap threshold to split sessions for watch-time aggregation (default: 120)
+  - Also controls idle timeout used to close watch sessions when viewers stop sending events
 - `UNIQUE_VIEWERS_WINDOW_SECONDS` - Window used for `cdn_viewers_unique*` metrics (default: 3600 = 1 hour)
 - `SESSION_STATE_PATH` - Optional path to persisted session tracker snapshot file (example: `/app/state/session_state.json.gz`)
 - `SESSION_STATE_SAVE_INTERVAL_SECONDS` - Background session snapshot interval in seconds (default: `300`)

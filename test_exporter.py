@@ -1122,6 +1122,10 @@ class TestSessionTracker:
             m for m in metrics
             if m['metric_name'] == 'cdn77_watch_session_duration_seconds_bucket' and m['labels']['le'] == '1200'
         ][0]
+        band_5_20m = [
+            m for m in metrics
+            if m['metric_name'] == 'cdn77_watch_session_duration_band_total' and m['labels']['band'] == '5_20m'
+        ][0]
         inf_bucket = [
             m for m in metrics
             if m['metric_name'] == 'cdn77_watch_session_duration_seconds_bucket' and m['labels']['le'] == '+Inf'
@@ -1130,6 +1134,7 @@ class TestSessionTracker:
         assert sessions_metric['value'] == 1.0
         assert watch_time_metric['value'] == 1200.0
         assert p1200_bucket['value'] == 1.0
+        assert band_5_20m['value'] == 1.0
         assert inf_bucket['value'] == 1.0
 
     def test_watch_time_metrics_split_on_session_gap(self):
@@ -1177,9 +1182,61 @@ class TestSessionTracker:
         metrics = tracker.get_watch_time_metrics(reference_time=t2)
         sessions_metric = [m for m in metrics if m['metric_name'] == 'cdn77_watch_sessions_total'][0]
         watch_time_metric = [m for m in metrics if m['metric_name'] == 'cdn77_watch_time_seconds_total'][0]
+        band_0_1m = [
+            m for m in metrics
+            if m['metric_name'] == 'cdn77_watch_session_duration_band_total' and m['labels']['band'] == '0_1m'
+        ][0]
 
         assert sessions_metric['value'] == 1.0
         assert watch_time_metric['value'] == 30.0
+        assert band_0_1m['value'] == 1.0
+
+    def test_watch_time_metrics_close_idle_sessions_without_window_expiry(self):
+        """Idle sessions should close at session_gap_seconds, independent of session window expiry."""
+        tracker = SessionTracker(window_seconds=7200, session_gap_seconds=120)
+
+        stream_id = "abcd1234567890abcdef1234567890ab"
+        t0 = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+        t1 = t0 + timedelta(seconds=45)
+
+        tracker.update([
+            Event(
+                timestamp=t0,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="web",
+                resource_id=123, cache_status="HIT", response_bytes=1000,
+                time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
+                response_status=200, client_country="US", location_id="testPOP",
+                raw_data={}
+            ),
+            Event(
+                timestamp=t1,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="web",
+                resource_id=123, cache_status="HIT", response_bytes=1000,
+                time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
+                response_status=200, client_country="US", location_id="testPOP",
+                raw_data={}
+            ),
+        ])
+
+        # Move past gap threshold but remain well within 2h session window.
+        reference_time = t1 + timedelta(seconds=180)
+        tracker.expire_old(reference_time)
+        metrics = tracker.get_watch_time_metrics(reference_time=reference_time)
+
+        sessions_metric = [m for m in metrics if m['metric_name'] == 'cdn77_watch_sessions_total'][0]
+        watch_time_metric = [m for m in metrics if m['metric_name'] == 'cdn77_watch_time_seconds_total'][0]
+        band_0_1m = [
+            m for m in metrics
+            if m['metric_name'] == 'cdn77_watch_session_duration_band_total' and m['labels']['band'] == '0_1m'
+        ][0]
+
+        assert sessions_metric['value'] == 1.0
+        assert watch_time_metric['value'] == 45.0
+        assert band_0_1m['value'] == 1.0
 
     def test_region_metrics_use_geoip_when_region_missing(self):
         """Region gauges should use GeoIP lookup when event only has country code."""
@@ -1359,6 +1416,80 @@ class TestSessionTracker:
             restored = SessionTracker(window_seconds=3600)
             count = restored.restore_from_file(snapshot_path, reference_time=base_time)
             assert count == 0
+
+    def test_session_state_persists_watch_duration_bands(self):
+        """Persist/restore should retain rolled-up watch duration band counters."""
+        tracker = SessionTracker(window_seconds=7200, session_gap_seconds=120)
+        stream_id = "abcd1234567890abcdef1234567890ab"
+        base_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+
+        tracker.update([
+            Event(
+                timestamp=base_time,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="testPOP",
+                raw_data={},
+            ),
+            Event(
+                timestamp=base_time + timedelta(seconds=90),
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="testPOP",
+                raw_data={},
+            ),
+            Event(
+                timestamp=base_time + timedelta(minutes=10),
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type="web",
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country="US",
+                location_id="testPOP",
+                raw_data={},
+            ),
+        ])
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            snapshot_path = os.path.join(tmp_dir, "session_state.json.gz")
+            assert tracker.persist_to_file(snapshot_path, reference_time=base_time + timedelta(minutes=10))
+
+            restored = SessionTracker(window_seconds=7200, session_gap_seconds=120)
+            restored.restore_from_file(snapshot_path, reference_time=base_time + timedelta(minutes=10))
+            metrics = restored.get_watch_time_metrics(reference_time=base_time + timedelta(minutes=10))
+
+            sessions_metric = [m for m in metrics if m['metric_name'] == 'cdn77_watch_sessions_total'][0]
+            band_metric = [
+                m for m in metrics
+                if m['metric_name'] == 'cdn77_watch_session_duration_band_total' and m['labels']['band'] == '1_5m'
+            ][0]
+
+            assert sessions_metric['value'] == 1.0
+            assert band_metric['value'] == 1.0
 
     def test_region_metric_has_expected_labels(self):
         """Region metric should include stream/country/region labels."""
