@@ -2,9 +2,11 @@
 
 IMAGE_NAME := cdn77-exporter
 IMAGE_TAG := latest
+RUST_IMAGE := rust:1.88
+PYTHON_IMAGE := python:3.11-alpine
+BENCH_PYTHON_IMAGE := python:3.11-slim
 
 BENCH_SCALE ?= medium
-VENV := .venv/bin
 CDN_EXPORTER := cdn-exporter/target/release/cdn-exporter
 CDN_EXPORTER_POLARS := cdn-exporter-polars/target/release/cdn-exporter-polars
 
@@ -39,25 +41,50 @@ test-docker:
 
 bench:
 	@echo "Running benchmarks at scale: $(BENCH_SCALE)"
-	$(VENV)/python bench_exporter.py --scale $(BENCH_SCALE) --output bench_results/
+	@docker run --rm -v "$(PWD)":/app $(BENCH_PYTHON_IMAGE) sh -c "\
+		cd /app && \
+		apt-get update >/dev/null 2>&1 && \
+		apt-get install -y --no-install-recommends build-essential libffi-dev libsnappy-dev >/dev/null 2>&1 && \
+		pip install -q -r requirements.txt && \
+		python bench_exporter.py --scale $(BENCH_SCALE) --output bench_results/"
 
 $(CDN_EXPORTER): cdn-exporter/src/*.rs cdn-exporter/Cargo.toml
 	@echo "Building cdn-exporter (Rust)..."
-	cd cdn-exporter && cargo build --release
+	docker run --rm \
+		-u "$$(id -u):$$(id -g)" \
+		-v "$(PWD)":/workspace \
+		-w /workspace/cdn-exporter \
+		$(RUST_IMAGE) \
+		cargo build --release
 
 $(CDN_EXPORTER_POLARS): cdn-exporter-polars/src/*.rs cdn-exporter-polars/Cargo.toml
 	@echo "Building cdn-exporter-polars (Rust + Polars)..."
-	cd cdn-exporter-polars && cargo build --release
+	docker run --rm \
+		-u "$$(id -u):$$(id -g)" \
+		-v "$(PWD)":/workspace \
+		-w /workspace/cdn-exporter-polars \
+		$(RUST_IMAGE) \
+		cargo build --release
 
 bench-rust: $(CDN_EXPORTER) $(CDN_EXPORTER_POLARS)
 	@echo "Running Rust benchmarks at scale: $(BENCH_SCALE)"
-	$(VENV)/python bench_exporter.py --scale $(BENCH_SCALE) --only end_to_end_cdn_exporter,end_to_end_cdn_exporter_polars --output bench_results/
+	@docker run --rm -v "$(PWD)":/app $(BENCH_PYTHON_IMAGE) sh -c "\
+		cd /app && \
+		apt-get update >/dev/null 2>&1 && \
+		apt-get install -y --no-install-recommends build-essential libffi-dev libsnappy-dev >/dev/null 2>&1 && \
+		pip install -q -r requirements.txt && \
+		python bench_exporter.py --scale $(BENCH_SCALE) --only end_to_end_cdn_exporter,end_to_end_cdn_exporter_polars --output bench_results/"
 
 bench-compare: $(CDN_EXPORTER) $(CDN_EXPORTER_POLARS)
 	@echo "Running all implementations at scale: $(BENCH_SCALE)"
-	$(VENV)/python bench_exporter.py --scale $(BENCH_SCALE) \
-		--only end_to_end_baseline,end_to_end,end_to_end_hybrid,end_to_end_native,end_to_end_cdn_exporter,end_to_end_cdn_exporter_polars,aggregate,aggregate_polars \
-		--output bench_results/
+	@docker run --rm -v "$(PWD)":/app $(BENCH_PYTHON_IMAGE) sh -c "\
+		cd /app && \
+		apt-get update >/dev/null 2>&1 && \
+		apt-get install -y --no-install-recommends build-essential libffi-dev libsnappy-dev >/dev/null 2>&1 && \
+		pip install -q -r requirements.txt && \
+		python bench_exporter.py --scale $(BENCH_SCALE) \
+			--only end_to_end_baseline,end_to_end,end_to_end_hybrid,end_to_end_native,end_to_end_cdn_exporter,end_to_end_cdn_exporter_polars,aggregate,aggregate_polars \
+			--output bench_results/"
 
 profile:
 	@echo "Generating CPU flamegraph at scale: $(BENCH_SCALE) (requires sudo)"

@@ -13,6 +13,9 @@ import tempfile
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict
 import pytest
+import snappy
+
+import remote_pb2
 
 os.environ.setdefault("METRIC_PREFIX", "cdn77_")
 
@@ -21,6 +24,7 @@ from exporter import (
     MetricDefinition, METRIC_DEFINITIONS, detect_device_type,
     SessionTracker, SessionInfo,
     build_file_viewer_metrics,
+    PrometheusExporter,
     PrometheusWriterThread,
     extract_stream_id, extract_cdn_id, extract_cache_status,
     extract_location_id, extract_response_status, extract_client_ip, extract_device_type,
@@ -2237,6 +2241,45 @@ class TestPrometheusWriterRetries:
 
         assert ok is False
         assert exporter.calls == 3
+
+
+class TestPrometheusExporterPush:
+    def test_push_metrics_handles_quoted_commas_in_labels(self, monkeypatch):
+        captured = {}
+
+        class _OkResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+        def _fake_post(url, data, headers, auth):
+            captured['url'] = url
+            captured['data'] = data
+            captured['headers'] = headers
+            captured['auth'] = auth
+            return _OkResponse()
+
+        monkeypatch.setattr("exporter.requests.post", _fake_post)
+
+        exporter = PrometheusExporter("https://prometheus.example.com/api/v1/write")
+        ok = exporter.push_metrics([
+            {
+                'metric': 'cdn77_viewers_by_resolution{stream="abc",track="1080p,h264"}',
+                'value': 7.0,
+                'timestamp': 1710592440000,
+            }
+        ])
+
+        assert ok is True
+        payload = remote_pb2.WriteRequest()
+        payload.ParseFromString(snappy.decompress(captured['data']))
+
+        assert len(payload.timeseries) == 1
+        labels = {label.name: label.value for label in payload.timeseries[0].labels}
+        assert labels['__name__'] == 'cdn77_viewers_by_resolution'
+        assert labels['stream'] == 'abc'
+        assert labels['track'] == '1080p,h264'
 
 
 # ============================================================================

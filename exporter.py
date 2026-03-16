@@ -136,6 +136,97 @@ def metric_name(suffix: str) -> str:
     return f"{METRIC_PREFIX}{suffix}"
 
 
+def _escape_prometheus_label_value(value: Any) -> str:
+    """Escape a label value for Prometheus text-format style label sets."""
+    text = str(value)
+    return text.replace('\\', '\\\\').replace('\n', '\\n').replace('"', '\\"')
+
+
+def _parse_metric_identifier(metric_str: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """Parse metric identifier like metric{label="value",...} into name + label pairs."""
+    metric_text = (metric_str or "").strip()
+    if not metric_text:
+        raise ValueError("empty metric identifier")
+
+    if '{' not in metric_text:
+        return metric_text, []
+
+    first_brace = metric_text.find('{')
+    last_brace = metric_text.rfind('}')
+
+    if first_brace < 1 or last_brace < first_brace:
+        raise ValueError(f"invalid metric identifier: {metric_text}")
+
+    metric = metric_text[:first_brace]
+    labels_blob = metric_text[first_brace + 1:last_brace].strip()
+    if not labels_blob:
+        return metric, []
+
+    labels: List[Tuple[str, str]] = []
+    idx = 0
+    total = len(labels_blob)
+
+    while idx < total:
+        while idx < total and labels_blob[idx].isspace():
+            idx += 1
+        if idx >= total:
+            break
+
+        eq_idx = labels_blob.find('=', idx)
+        if eq_idx == -1:
+            raise ValueError(f"invalid label segment in metric identifier: {metric_text}")
+
+        label_name = labels_blob[idx:eq_idx].strip()
+        if not label_name:
+            raise ValueError(f"empty label name in metric identifier: {metric_text}")
+
+        idx = eq_idx + 1
+        if idx >= total or labels_blob[idx] != '"':
+            raise ValueError(f"label value must be quoted in metric identifier: {metric_text}")
+
+        idx += 1
+        value_chars: List[str] = []
+        escaped = False
+
+        while idx < total:
+            ch = labels_blob[idx]
+            if escaped:
+                if ch == 'n':
+                    value_chars.append('\n')
+                else:
+                    value_chars.append(ch)
+                escaped = False
+                idx += 1
+                continue
+
+            if ch == '\\':
+                escaped = True
+                idx += 1
+                continue
+
+            if ch == '"':
+                break
+
+            value_chars.append(ch)
+            idx += 1
+
+        if idx >= total or labels_blob[idx] != '"':
+            raise ValueError(f"unterminated label value in metric identifier: {metric_text}")
+
+        labels.append((label_name, ''.join(value_chars)))
+        idx += 1
+
+        while idx < total and labels_blob[idx].isspace():
+            idx += 1
+        if idx >= total:
+            break
+        if labels_blob[idx] != ',':
+            raise ValueError(f"expected comma between labels in metric identifier: {metric_text}")
+        idx += 1
+
+    return metric, labels
+
+
 def add_legacy_stream_name_label(labels: Dict[str, str]) -> Dict[str, str]:
     """Add legacy stream_name label mirroring stream label when enabled."""
     if not EMIT_LEGACY_STREAM_NAME_LABEL:
@@ -152,9 +243,10 @@ def add_legacy_stream_name_label(labels: Dict[str, str]) -> Dict[str, str]:
 
 def stream_label_selector(stream: str) -> str:
     """Build stream label selector string with optional legacy stream_name mirror."""
-    labels = [f'stream="{stream}"']
+    escaped_stream = _escape_prometheus_label_value(stream)
+    labels = [f'stream="{escaped_stream}"']
     if EMIT_LEGACY_STREAM_NAME_LABEL:
-        labels.append(f'stream_name="{stream}"')
+        labels.append(f'stream_name="{escaped_stream}"')
     return ','.join(labels)
 
 
@@ -1029,28 +1121,28 @@ def build_file_viewer_metrics(
 
     for (stream, device_type), ips in by_stream_device.items():
         metrics.append({
-            'metric': f'{metric_name("viewers_by_device")}{{{stream_label_selector(stream)},device_type="{device_type}"}}',
+            'metric': f'{metric_name("viewers_by_device")}{{{stream_label_selector(stream)},device_type="{_escape_prometheus_label_value(device_type)}"}}',
             'value': float(len(ips)),
             'timestamp': timestamp_ms,
         })
 
     for (stream, country), ips in by_stream_country.items():
         metrics.append({
-            'metric': f'{metric_name("viewers_by_country")}{{{stream_label_selector(stream)},country="{country}"}}',
+            'metric': f'{metric_name("viewers_by_country")}{{{stream_label_selector(stream)},country="{_escape_prometheus_label_value(country)}"}}',
             'value': float(len(ips)),
             'timestamp': timestamp_ms,
         })
 
     for (stream, track), ips in by_stream_track.items():
         metrics.append({
-            'metric': f'{metric_name("viewers_by_resolution")}{{{stream_label_selector(stream)},track="{track}"}}',
+            'metric': f'{metric_name("viewers_by_resolution")}{{{stream_label_selector(stream)},track="{_escape_prometheus_label_value(track)}"}}',
             'value': float(len(ips)),
             'timestamp': timestamp_ms,
         })
 
     for (stream, country, region), ips in by_stream_region.items():
         metrics.append({
-            'metric': f'{metric_name("viewers_by_region")}{{{stream_label_selector(stream)},country="{country}",region="{region}"}}',
+            'metric': f'{metric_name("viewers_by_region")}{{{stream_label_selector(stream)},country="{_escape_prometheus_label_value(country)}",region="{_escape_prometheus_label_value(region)}"}}',
             'value': float(len(ips)),
             'timestamp': timestamp_ms,
         })
@@ -1704,7 +1796,7 @@ class PrometheusExporter:
             output_labels = add_legacy_stream_name_label(labels)
             for key, val in sorted(output_labels.items()):
                 if key != 'minute':
-                    label_strs.append(f'{key}="{val}"')
+                    label_strs.append(f'{key}="{_escape_prometheus_label_value(val)}"')
             label_string = ','.join(label_strs)
             
             metrics.append({
@@ -1744,7 +1836,7 @@ class PrometheusExporter:
             label_strs = []
             output_labels = add_legacy_stream_name_label(labels)
             for key, val in sorted(output_labels.items()):
-                label_strs.append(f'{key}="{val}"')
+                label_strs.append(f'{key}="{_escape_prometheus_label_value(val)}"')
             label_string = ','.join(label_strs)
             
             metrics.append({
@@ -1777,13 +1869,7 @@ class PrometheusExporter:
                 
                 # Parse metric name and labels
                 metric_str = metric_data['metric']
-                if '{' in metric_str and metric_str.endswith('}'):
-                    brace_idx = metric_str.index('{')
-                    metric_name = metric_str[:brace_idx]
-                    labels_str = metric_str[brace_idx+1:-1]
-                else:
-                    metric_name = metric_str
-                    labels_str = ""
+                metric_name, label_pairs = _parse_metric_identifier(metric_str)
                 
                 # Add __name__ label
                 label = ts.labels.add()
@@ -1791,16 +1877,10 @@ class PrometheusExporter:
                 label.value = metric_name
                 
                 # Add other labels
-                if labels_str:
-                    for label_pair in labels_str.split(','):
-                        if not label_pair:
-                            continue
-                        eq_idx = label_pair.index('=')
-                        key = label_pair[:eq_idx]
-                        value = label_pair[eq_idx+2:-1]
-                        label = ts.labels.add()
-                        label.name = key
-                        label.value = value
+                for key, value in label_pairs:
+                    label = ts.labels.add()
+                    label.name = key
+                    label.value = value
                 
                 # Add sample
                 sample = ts.samples.add()
