@@ -18,5 +18,9 @@ maxmind/
 # Benchmarks
 bench_results/
 
+# Rust
+cdn-exporter/target/
+cdn-exporter-polars/target/
+
 # OS
 .DS_Store

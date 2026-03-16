@@ -481,7 +481,6 @@ class TestLabelExtractors:
             location_id="losangelesUSCA",
             client_ip="192.168.1.1",
             device_type="web",
-            raw_data={}
         )
         
         assert extract_stream_id(event) == "abc123def456"
@@ -502,7 +501,6 @@ class TestLabelExtractors:
             location_id="losangelesUSCA",
             client_ip="10.20.30.40",
             device_type="web",
-            raw_data={}
         )
         
         assert extract_client_ip(event) == "10.20.30.40"
@@ -529,9 +527,7 @@ class TestLabelExtractors:
             location_id="losangelesUSCA",
             client_ip="10.20.30.40",
             device_type="web",
-            raw_data={
-                "clientRequestPath": "/99641d13e41ef47215b12671803bb13c/tracks-v3/rewind-43200.fmp4.m3u8"
-            }
+            request_path="/99641d13e41ef47215b12671803bb13c/tracks-v3/rewind-43200.fmp4.m3u8"
         )
 
         assert extract_resolution_track(event) == "v3"
@@ -669,8 +665,7 @@ class TestDeviceDetection:
                 response_status=200,
                 client_country="US",
                 location_id="losangelesUSCA",
-                raw_data={}
-            ),
+                ),
             Event(
                 timestamp=base_time,
                 stream_id=stream_id,
@@ -685,8 +680,7 @@ class TestDeviceDetection:
                 response_status=200,
                 client_country="US",
                 location_id="losangelesUSCA",
-                raw_data={}
-            ),
+                ),
             Event(
                 timestamp=base_time,
                 stream_id=stream_id,
@@ -701,8 +695,7 @@ class TestDeviceDetection:
                 response_status=200,
                 client_country="US",
                 location_id="losangelesUSCA",
-                raw_data={}
-            ),
+                ),
             Event(
                 timestamp=base_time,
                 stream_id=stream_id,
@@ -717,8 +710,7 @@ class TestDeviceDetection:
                 response_status=200,
                 client_country="CA",
                 location_id="losangelesUSCA",
-                raw_data={}
-            ),
+                ),
             Event(
                 timestamp=base_time,
                 stream_id=stream_id,
@@ -733,8 +725,7 @@ class TestDeviceDetection:
                 response_status=200,
                 client_country="CA",
                 location_id="losangelesUSCA",
-                raw_data={}
-            ),
+                ),
         ]
         
         aggregated = aggregator.aggregate_events(events)
@@ -919,8 +910,7 @@ class TestSessionTracker:
                 client_country="US",
                 location_id="losangelesUSCA",
                 device_type="web",
-                raw_data={}
-            )
+                )
             events.append(event)
         
         tracker.update(events)
@@ -952,7 +942,6 @@ class TestSessionTracker:
             client_country="US",
             location_id="losangelesUSCA",
             device_type="web",
-            raw_data={}
         )
         
         tracker.update([event1])
@@ -979,8 +968,7 @@ class TestSessionTracker:
                 resource_id=123, cache_status="HIT", response_bytes=1000,
                 time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
                 response_status=200, client_country="US", location_id="losangelesUSCA",
-                raw_data={}
-            ),
+                ),
             Event(
                 timestamp=base_time,
                 stream_id=stream_id,
@@ -989,8 +977,7 @@ class TestSessionTracker:
                 resource_id=123, cache_status="HIT", response_bytes=1000,
                 time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
                 response_status=200, client_country="US", location_id="losangelesUSCA",
-                raw_data={}
-            ),
+                ),
             Event(
                 timestamp=base_time,
                 stream_id=stream_id,
@@ -999,8 +986,7 @@ class TestSessionTracker:
                 resource_id=123, cache_status="HIT", response_bytes=1000,
                 time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
                 response_status=200, client_country="CA", location_id="losangelesUSCA",
-                raw_data={}
-            )
+                )
         ]
         
         tracker.update(events)
@@ -1040,8 +1026,7 @@ class TestSessionTracker:
                 resource_id=123, cache_status="HIT", response_bytes=1000,
                 time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
                 response_status=200, client_country="US", location_id="losangelesUSCA",
-                raw_data={}
-            )
+                )
         ]
         
         tracker.update(batch1)
@@ -1057,8 +1042,7 @@ class TestSessionTracker:
                 resource_id=123, cache_status="HIT", response_bytes=1000,
                 time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
                 response_status=200, client_country="US", location_id="losangelesUSCA",
-                raw_data={}
-            ),
+                ),
             Event(
                 timestamp=base_time - timedelta(minutes=5),
                 stream_id=stream_id,
@@ -1067,8 +1051,7 @@ class TestSessionTracker:
                 resource_id=123, cache_status="HIT", response_bytes=1000,
                 time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
                 response_status=200, client_country="US", location_id="losangelesUSCA",
-                raw_data={}
-            )
+                )
         ]
         
         tracker.update(batch2)
@@ -1098,8 +1081,7 @@ class TestSessionTracker:
                 resource_id=123, cache_status="HIT", response_bytes=1000,
                 time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
                 response_status=200, client_country="US", location_id="testPOP",
-                raw_data={}
-            ),
+                ),
             Event(
                 timestamp=end,
                 stream_id=stream_id,
@@ -1108,8 +1090,7 @@ class TestSessionTracker:
                 resource_id=123, cache_status="HIT", response_bytes=1000,
                 time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
                 response_status=200, client_country="US", location_id="testPOP",
-                raw_data={}
-            ),
+                ),
         ])
 
         # Force expiry to close active session and roll-up duration
@@ -1155,8 +1136,7 @@ class TestSessionTracker:
                 resource_id=123, cache_status="HIT", response_bytes=1000,
                 time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
                 response_status=200, client_country="US", location_id="testPOP",
-                raw_data={}
-            ),
+                ),
             Event(
                 timestamp=t1,
                 stream_id=stream_id,
@@ -1165,8 +1145,7 @@ class TestSessionTracker:
                 resource_id=123, cache_status="HIT", response_bytes=1000,
                 time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
                 response_status=200, client_country="US", location_id="testPOP",
-                raw_data={}
-            ),
+                ),
             Event(
                 timestamp=t2,
                 stream_id=stream_id,
@@ -1175,8 +1154,7 @@ class TestSessionTracker:
                 resource_id=123, cache_status="HIT", response_bytes=1000,
                 time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
                 response_status=200, client_country="US", location_id="testPOP",
-                raw_data={}
-            ),
+                ),
         ])
 
         metrics = tracker.get_watch_time_metrics(reference_time=t2)
@@ -1208,8 +1186,7 @@ class TestSessionTracker:
                 resource_id=123, cache_status="HIT", response_bytes=1000,
                 time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
                 response_status=200, client_country="US", location_id="testPOP",
-                raw_data={}
-            ),
+                ),
             Event(
                 timestamp=t1,
                 stream_id=stream_id,
@@ -1218,8 +1195,7 @@ class TestSessionTracker:
                 resource_id=123, cache_status="HIT", response_bytes=1000,
                 time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
                 response_status=200, client_country="US", location_id="testPOP",
-                raw_data={}
-            ),
+                ),
         ])
 
         # Move past gap threshold but remain well within 2h session window.
@@ -1258,7 +1234,6 @@ class TestSessionTracker:
             response_status=200,
             client_country="US",
             location_id="losangelesUSCA",
-            raw_data={},
         )
 
         tracker.update([event])
@@ -1288,7 +1263,6 @@ class TestSessionTracker:
             response_status=200,
             client_country="US",
             location_id="losangelesUSCA",
-            raw_data={},
         )
 
         tracker.update([event])
@@ -1352,7 +1326,6 @@ class TestSessionTracker:
                 response_status=200,
                 client_country="US",
                 location_id="testPOP",
-                raw_data={},
             ),
             Event(
                 timestamp=now,
@@ -1368,7 +1341,6 @@ class TestSessionTracker:
                 response_status=200,
                 client_country="US",
                 location_id="testPOP",
-                raw_data={},
             ),
         ]
         tracker.update(events)
@@ -1405,7 +1377,6 @@ class TestSessionTracker:
                 response_status=200,
                 client_country="US",
                 location_id="testPOP",
-                raw_data={},
             )
         ])
 
@@ -1438,7 +1409,6 @@ class TestSessionTracker:
                 response_status=200,
                 client_country="US",
                 location_id="testPOP",
-                raw_data={},
             ),
             Event(
                 timestamp=base_time + timedelta(seconds=90),
@@ -1454,7 +1424,6 @@ class TestSessionTracker:
                 response_status=200,
                 client_country="US",
                 location_id="testPOP",
-                raw_data={},
             ),
             Event(
                 timestamp=base_time + timedelta(minutes=10),
@@ -1470,7 +1439,6 @@ class TestSessionTracker:
                 response_status=200,
                 client_country="US",
                 location_id="testPOP",
-                raw_data={},
             ),
         ])
 
@@ -1518,7 +1486,6 @@ class TestSessionTracker:
                 response_status=200,
                 client_country="US",
                 location_id="losangelesUSCA",
-                raw_data={},
             ),
             Event(
                 timestamp=base_time,
@@ -1534,7 +1501,6 @@ class TestSessionTracker:
                 response_status=200,
                 client_country="AU",
                 location_id="sydneyAUNSW",
-                raw_data={},
             ),
         ]
 
@@ -1581,7 +1547,6 @@ class TestSessionTracker:
                     response_status=200,
                     client_country=country,
                     location_id="testPOP",
-                    raw_data={},
                 )
             )
 
@@ -1623,7 +1588,6 @@ class TestSessionTracker:
             response_status=200,
             client_country="US",
             location_id="testPOP",
-            raw_data={},
         )
         old_event = Event(
             timestamp=now - timedelta(minutes=90),
@@ -1639,7 +1603,6 @@ class TestSessionTracker:
             response_status=200,
             client_country="US",
             location_id="testPOP",
-            raw_data={},
         )
 
         tracker.update([recent_event, old_event])
@@ -1669,7 +1632,6 @@ class TestSessionTracker:
             response_status=200,
             client_country="US",
             location_id="testPOP",
-            raw_data={},
         )
 
         tracker.update([event])
@@ -1707,9 +1669,7 @@ class TestFileViewerMetrics:
                 response_status=200,
                 client_country="US",
                 location_id="testPOP",
-                raw_data={
-                    "clientRequestPath": f"/{stream_id}/tracks-v3/rewind-43200.fmp4.m3u8"
-                },
+                request_path=f"/{stream_id}/tracks-v3/rewind-43200.fmp4.m3u8",
             ),
             Event(
                 timestamp=base_time,
@@ -1725,9 +1685,7 @@ class TestFileViewerMetrics:
                 response_status=200,
                 client_country="US",
                 location_id="testPOP",
-                raw_data={
-                    "clientRequestPath": f"/{stream_id}/tracks-v3/rewind-43200.fmp4.m3u8"
-                },
+                request_path=f"/{stream_id}/tracks-v3/rewind-43200.fmp4.m3u8",
             ),
             Event(
                 timestamp=base_time,
@@ -1743,9 +1701,7 @@ class TestFileViewerMetrics:
                 response_status=200,
                 client_country="US",
                 location_id="testPOP",
-                raw_data={
-                    "clientRequestPath": f"/{stream_id}/tracks-v3/rewind-43200.fmp4.m3u8"
-                },
+                request_path=f"/{stream_id}/tracks-v3/rewind-43200.fmp4.m3u8",
             ),
             Event(
                 timestamp=base_time,
@@ -1761,9 +1717,7 @@ class TestFileViewerMetrics:
                 response_status=200,
                 client_country="US",
                 location_id="testPOP",
-                raw_data={
-                    "clientRequestPath": f"/{stream_id}/tracks-a1/rewind-43200.fmp4.m3u8"
-                },
+                request_path=f"/{stream_id}/tracks-a1/rewind-43200.fmp4.m3u8",
             ),
         ]
 
@@ -1802,7 +1756,6 @@ class TestFileViewerMetrics:
             response_status=200,
             client_country="US",
             location_id="testPOP",
-            raw_data={},
         )
 
         metrics = build_file_viewer_metrics(
@@ -1897,8 +1850,7 @@ class TestSessionTrackerSimulation:
                         response_status=200,
                         client_country=random.choice(["US", "CA", "GB", "DE", "FR"]),
                         location_id="losangelesUSCA",
-                        raw_data={}
-                    )
+                                )
                     events.append(event)
                     total_events += 1
             
@@ -2016,8 +1968,7 @@ class TestSessionTrackerSimulation:
                     response_status=200,
                     client_country="US",
                     location_id="losangelesUSCA",
-                    raw_data={}
-                )
+                        )
                 events.append(event)
             
             # Update tracker
@@ -2084,8 +2035,7 @@ class TestSessionTrackerSimulation:
                     response_status=200,
                     client_country="US",
                     location_id="losangelesUSCA",
-                    raw_data={}
-                )
+                        )
                 events.append(event)
                 
                 # Batch update every 10K to avoid memory spike
@@ -2197,8 +2147,7 @@ class TestSessionTrackerSimulation:
                 response_status=200,
                 client_country=country,
                 location_id="losangelesUSCA",
-                raw_data={}
-            )
+                )
             events.append(event)
         
         # Update tracker

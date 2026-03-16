@@ -1,20 +1,24 @@
-.PHONY: build test test-docker clean help bench profile
+.PHONY: build test test-docker clean help bench bench-compare profile bench-rust
 
 IMAGE_NAME := cdn77-exporter
 IMAGE_TAG := latest
 
 BENCH_SCALE ?= medium
 VENV := .venv/bin
+CDN_EXPORTER := cdn-exporter/target/release/cdn-exporter
+CDN_EXPORTER_POLARS := cdn-exporter-polars/target/release/cdn-exporter-polars
 
 help:
 	@echo "CDN77 Prometheus Exporter - Available targets:"
-	@echo "  make build       - Build production Docker image"
-	@echo "  make test        - Run tests locally with Docker"
-	@echo "  make test-docker - Run tests in Docker build (faster)"
-	@echo "  make bench       - Run performance benchmarks (BENCH_SCALE=small|medium|large|xl)"
-	@echo "  make profile     - Generate py-spy CPU flamegraph (requires sudo)"
-	@echo "  make clean       - Remove test artifacts and cache"
-	@echo "  make help        - Show this help message"
+	@echo "  make build         - Build production Docker image"
+	@echo "  make test          - Run tests locally with Docker"
+	@echo "  make test-docker   - Run tests in Docker build (faster)"
+	@echo "  make bench         - Run performance benchmarks (BENCH_SCALE=small|medium|large|xl)"
+	@echo "  make bench-compare - Run all implementations head-to-head with output validation"
+	@echo "  make bench-rust    - Build and benchmark cdn-exporter (Rust)"
+	@echo "  make profile       - Generate py-spy CPU flamegraph (requires sudo)"
+	@echo "  make clean         - Remove test artifacts and cache"
+	@echo "  make help          - Show this help message"
 
 build:
 	@echo "Building Docker image: $(IMAGE_NAME):$(IMAGE_TAG)"
@@ -36,6 +40,24 @@ test-docker:
 bench:
 	@echo "Running benchmarks at scale: $(BENCH_SCALE)"
 	$(VENV)/python bench_exporter.py --scale $(BENCH_SCALE) --output bench_results/
+
+$(CDN_EXPORTER): cdn-exporter/src/*.rs cdn-exporter/Cargo.toml
+	@echo "Building cdn-exporter (Rust)..."
+	cd cdn-exporter && cargo build --release
+
+$(CDN_EXPORTER_POLARS): cdn-exporter-polars/src/*.rs cdn-exporter-polars/Cargo.toml
+	@echo "Building cdn-exporter-polars (Rust + Polars)..."
+	cd cdn-exporter-polars && cargo build --release
+
+bench-rust: $(CDN_EXPORTER) $(CDN_EXPORTER_POLARS)
+	@echo "Running Rust benchmarks at scale: $(BENCH_SCALE)"
+	$(VENV)/python bench_exporter.py --scale $(BENCH_SCALE) --only end_to_end_cdn_exporter,end_to_end_cdn_exporter_polars --output bench_results/
+
+bench-compare: $(CDN_EXPORTER) $(CDN_EXPORTER_POLARS)
+	@echo "Running all implementations at scale: $(BENCH_SCALE)"
+	$(VENV)/python bench_exporter.py --scale $(BENCH_SCALE) \
+		--only end_to_end_baseline,end_to_end,end_to_end_hybrid,end_to_end_native,end_to_end_cdn_exporter,end_to_end_cdn_exporter_polars,aggregate,aggregate_polars \
+		--output bench_results/
 
 profile:
 	@echo "Generating CPU flamegraph at scale: $(BENCH_SCALE) (requires sudo)"

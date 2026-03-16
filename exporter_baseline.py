@@ -12,14 +12,7 @@ Architecture:
 
 import argparse
 import gzip
-import io
 import json
-
-try:
-    import orjson
-    _json_loads = orjson.loads
-except ImportError:
-    _json_loads = json.loads
 import logging
 import os
 import queue
@@ -227,11 +220,12 @@ class Event:
     location_id: str
     client_ip: str
     device_type: str
-    request_path: str = ""
-    minute_key: str = field(init=False)
-
-    def __post_init__(self):
-        self.minute_key = self.timestamp.strftime('%d/%b/%Y %H:%M')
+    raw_data: Dict[str, Any]  # Full JSON for future extensibility
+    
+    @property
+    def minute_key(self) -> str:
+        """Return minute-rounded timestamp key"""
+        return self.timestamp.strftime('%d/%b/%Y %H:%M')
 
 
 class AggregationType(Enum):
@@ -344,7 +338,7 @@ class EventBuffer:
             return len(self.events)
 
 
-@dataclass(slots=True)
+@dataclass
 class SessionInfo:
     """Information about an IP session"""
     first_seen: datetime
@@ -1204,7 +1198,8 @@ def extract_track_from_path(path: str) -> str:
 
 def extract_resolution_track(event: Event) -> str:
     """Extract track/resolution label from raw request path."""
-    return extract_track_from_path(event.request_path)
+    path = event.raw_data.get('clientRequestPath', '') if event.raw_data else ''
+    return extract_track_from_path(path)
 
 
 def is_video_track(track: str) -> bool:
@@ -1418,7 +1413,7 @@ class LogParser:
         - locationID: Edge location
         """
         try:
-            data = _json_loads(line)
+            data = json.loads(line)
             
             # Extract required fields
             timestamp_str = data.get('timestamp')
@@ -1476,7 +1471,7 @@ class LogParser:
                 location_id=data.get('locationID', 'unknown'),
                 client_ip=data.get('clientIP', '0.0.0.0'),
                 device_type=detect_device_type(user_agent),
-                request_path=path,
+                raw_data=data
             )
             
             return event
@@ -1568,11 +1563,6 @@ class MetricAggregator:
     
     def __init__(self, metric_definitions: List[MetricDefinition]):
         self.metric_definitions = metric_definitions
-        # Pre-compute sorted label keys per metric to avoid re-sorting on every event
-        self._sorted_keys = {
-            md.name: sorted(list(md.labels.keys()) + ['minute'])
-            for md in metric_definitions
-        }
     
     def aggregate_events(self, events: List[Event]) -> Dict[str, Dict[Tuple[str, ...], any]]:
         """
@@ -1598,8 +1588,8 @@ class MetricAggregator:
                 # Add minute to labels
                 labels['minute'] = event.minute_key
                 
-                # Create label tuple for grouping (pre-computed key order)
-                label_tuple = tuple(labels[k] for k in self._sorted_keys[metric_def.name])
+                # Create label tuple for grouping (sorted for consistency)
+                label_tuple = tuple(labels[k] for k in sorted(labels.keys()))
                 
                 # Initialize collection based on aggregation type
                 if label_tuple not in aggregated[metric_def.name]:
@@ -1649,8 +1639,10 @@ class MetricAggregator:
                     logger.warning(f"Unknown aggregation type: {metric_def.aggregation}")
                     continue
                 
-                # Reconstruct labels dict from tuple (using pre-computed key order)
-                all_label_keys = self._sorted_keys[metric_def.name]
+                # Reconstruct labels dict from tuple
+                # The tuple was created with sorted(labels.keys()), so we need the same order
+                # labels.keys() at creation time = sorted(metric_def.labels.keys()) + ['minute']
+                all_label_keys = sorted(list(metric_def.labels.keys()) + ['minute'])
                 labels_dict = dict(zip(all_label_keys, label_tuple))
                 
                 results.append({
@@ -2198,28 +2190,29 @@ class S3Importer:
                 emit_file_processing_metrics(False, lines_processed)
                 return False
             
-            # Stream-decompress gzip and parse events
-            events = []
-            invalid_lines = 0
-
+            # Decompress gzip
             try:
-                with gzip.open(io.BytesIO(compressed_data), 'rt', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.rstrip('\n')
-                        if not line.strip():
-                            continue
-
-                        lines_processed += 1
-                        event = self.parser.parse_json_to_event(line)
-
-                        if event:
-                            events.append(event)
-                        else:
-                            invalid_lines += 1
+                ndjson_content = gzip.decompress(compressed_data).decode('utf-8')
             except Exception as e:
                 logger.error(f"Failed to decompress {s3_key}: {e}")
                 emit_file_processing_metrics(False, lines_processed)
                 return False
+            
+            # Parse events from file
+            events = []
+            invalid_lines = 0
+            
+            for line in ndjson_content.splitlines():
+                if not line.strip():
+                    continue
+                
+                lines_processed += 1
+                event = self.parser.parse_json_to_event(line)
+                
+                if event:
+                    events.append(event)
+                else:
+                    invalid_lines += 1
             
             # Add all events to buffer (no immediate flush)
             if events:
