@@ -1,13 +1,18 @@
-.PHONY: build test test-docker clean help
+.PHONY: build test test-docker clean help bench profile
 
 IMAGE_NAME := cdn77-exporter
 IMAGE_TAG := latest
+
+BENCH_SCALE ?= medium
+VENV := .venv/bin
 
 help:
 	@echo "CDN77 Prometheus Exporter - Available targets:"
 	@echo "  make build       - Build production Docker image"
 	@echo "  make test        - Run tests locally with Docker"
 	@echo "  make test-docker - Run tests in Docker build (faster)"
+	@echo "  make bench       - Run performance benchmarks (BENCH_SCALE=small|medium|large|xl)"
+	@echo "  make profile     - Generate py-spy CPU flamegraph (requires sudo)"
 	@echo "  make clean       - Remove test artifacts and cache"
 	@echo "  make help        - Show this help message"
 
@@ -27,6 +32,15 @@ test-docker:
 	@echo "Running test suite in Docker build..."
 	@docker build --target test -f Dockerfile -t $(IMAGE_NAME):test . >/dev/null 2>&1 && \
 	echo "✓ All tests passed!"
+
+bench:
+	@echo "Running benchmarks at scale: $(BENCH_SCALE)"
+	$(VENV)/python bench_exporter.py --scale $(BENCH_SCALE) --output bench_results/
+
+profile:
+	@echo "Generating CPU flamegraph at scale: $(BENCH_SCALE) (requires sudo)"
+	sudo $(VENV)/py-spy record -o bench_results/flamegraph_$(BENCH_SCALE).svg -- $(VENV)/python bench_exporter.py --scale $(BENCH_SCALE)
+	@echo "Flamegraph saved to bench_results/flamegraph_$(BENCH_SCALE).svg"
 
 clean:
 	@echo "Cleaning up test artifacts..."

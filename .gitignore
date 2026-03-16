@@ -15,5 +15,8 @@ maxmind/
 .vscode/
 .idea/
 
+# Benchmarks
+bench_results/
+
 # OS
 .DS_Store
