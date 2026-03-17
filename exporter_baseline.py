@@ -12,14 +12,7 @@ Architecture:
 
 import argparse
 import gzip
-import io
 import json
-
-try:
-    import orjson
-    _json_loads = orjson.loads
-except ImportError:
-    _json_loads = json.loads
 import logging
 import os
 import queue
@@ -136,97 +129,6 @@ def metric_name(suffix: str) -> str:
     return f"{METRIC_PREFIX}{suffix}"
 
 
-def _escape_prometheus_label_value(value: Any) -> str:
-    """Escape a label value for Prometheus text-format style label sets."""
-    text = str(value)
-    return text.replace('\\', '\\\\').replace('\n', '\\n').replace('"', '\\"')
-
-
-def _parse_metric_identifier(metric_str: str) -> Tuple[str, List[Tuple[str, str]]]:
-    """Parse metric identifier like metric{label="value",...} into name + label pairs."""
-    metric_text = (metric_str or "").strip()
-    if not metric_text:
-        raise ValueError("empty metric identifier")
-
-    if '{' not in metric_text:
-        return metric_text, []
-
-    first_brace = metric_text.find('{')
-    last_brace = metric_text.rfind('}')
-
-    if first_brace < 1 or last_brace < first_brace:
-        raise ValueError(f"invalid metric identifier: {metric_text}")
-
-    metric = metric_text[:first_brace]
-    labels_blob = metric_text[first_brace + 1:last_brace].strip()
-    if not labels_blob:
-        return metric, []
-
-    labels: List[Tuple[str, str]] = []
-    idx = 0
-    total = len(labels_blob)
-
-    while idx < total:
-        while idx < total and labels_blob[idx].isspace():
-            idx += 1
-        if idx >= total:
-            break
-
-        eq_idx = labels_blob.find('=', idx)
-        if eq_idx == -1:
-            raise ValueError(f"invalid label segment in metric identifier: {metric_text}")
-
-        label_name = labels_blob[idx:eq_idx].strip()
-        if not label_name:
-            raise ValueError(f"empty label name in metric identifier: {metric_text}")
-
-        idx = eq_idx + 1
-        if idx >= total or labels_blob[idx] != '"':
-            raise ValueError(f"label value must be quoted in metric identifier: {metric_text}")
-
-        idx += 1
-        value_chars: List[str] = []
-        escaped = False
-
-        while idx < total:
-            ch = labels_blob[idx]
-            if escaped:
-                if ch == 'n':
-                    value_chars.append('\n')
-                else:
-                    value_chars.append(ch)
-                escaped = False
-                idx += 1
-                continue
-
-            if ch == '\\':
-                escaped = True
-                idx += 1
-                continue
-
-            if ch == '"':
-                break
-
-            value_chars.append(ch)
-            idx += 1
-
-        if idx >= total or labels_blob[idx] != '"':
-            raise ValueError(f"unterminated label value in metric identifier: {metric_text}")
-
-        labels.append((label_name, ''.join(value_chars)))
-        idx += 1
-
-        while idx < total and labels_blob[idx].isspace():
-            idx += 1
-        if idx >= total:
-            break
-        if labels_blob[idx] != ',':
-            raise ValueError(f"expected comma between labels in metric identifier: {metric_text}")
-        idx += 1
-
-    return metric, labels
-
-
 def add_legacy_stream_name_label(labels: Dict[str, str]) -> Dict[str, str]:
     """Add legacy stream_name label mirroring stream label when enabled."""
     if not EMIT_LEGACY_STREAM_NAME_LABEL:
@@ -243,10 +145,9 @@ def add_legacy_stream_name_label(labels: Dict[str, str]) -> Dict[str, str]:
 
 def stream_label_selector(stream: str) -> str:
     """Build stream label selector string with optional legacy stream_name mirror."""
-    escaped_stream = _escape_prometheus_label_value(stream)
-    labels = [f'stream="{escaped_stream}"']
+    labels = [f'stream="{stream}"']
     if EMIT_LEGACY_STREAM_NAME_LABEL:
-        labels.append(f'stream_name="{escaped_stream}"')
+        labels.append(f'stream_name="{stream}"')
     return ','.join(labels)
 
 
@@ -319,11 +220,12 @@ class Event:
     location_id: str
     client_ip: str
     device_type: str
-    request_path: str = ""
-    minute_key: str = field(init=False)
-
-    def __post_init__(self):
-        self.minute_key = self.timestamp.strftime('%d/%b/%Y %H:%M')
+    raw_data: Dict[str, Any]  # Full JSON for future extensibility
+    
+    @property
+    def minute_key(self) -> str:
+        """Return minute-rounded timestamp key"""
+        return self.timestamp.strftime('%d/%b/%Y %H:%M')
 
 
 class AggregationType(Enum):
@@ -436,7 +338,7 @@ class EventBuffer:
             return len(self.events)
 
 
-@dataclass(slots=True)
+@dataclass
 class SessionInfo:
     """Information about an IP session"""
     first_seen: datetime
@@ -1121,28 +1023,28 @@ def build_file_viewer_metrics(
 
     for (stream, device_type), ips in by_stream_device.items():
         metrics.append({
-            'metric': f'{metric_name("viewers_by_device")}{{{stream_label_selector(stream)},device_type="{_escape_prometheus_label_value(device_type)}"}}',
+            'metric': f'{metric_name("viewers_by_device")}{{{stream_label_selector(stream)},device_type="{device_type}"}}',
             'value': float(len(ips)),
             'timestamp': timestamp_ms,
         })
 
     for (stream, country), ips in by_stream_country.items():
         metrics.append({
-            'metric': f'{metric_name("viewers_by_country")}{{{stream_label_selector(stream)},country="{_escape_prometheus_label_value(country)}"}}',
+            'metric': f'{metric_name("viewers_by_country")}{{{stream_label_selector(stream)},country="{country}"}}',
             'value': float(len(ips)),
             'timestamp': timestamp_ms,
         })
 
     for (stream, track), ips in by_stream_track.items():
         metrics.append({
-            'metric': f'{metric_name("viewers_by_resolution")}{{{stream_label_selector(stream)},track="{_escape_prometheus_label_value(track)}"}}',
+            'metric': f'{metric_name("viewers_by_resolution")}{{{stream_label_selector(stream)},track="{track}"}}',
             'value': float(len(ips)),
             'timestamp': timestamp_ms,
         })
 
     for (stream, country, region), ips in by_stream_region.items():
         metrics.append({
-            'metric': f'{metric_name("viewers_by_region")}{{{stream_label_selector(stream)},country="{_escape_prometheus_label_value(country)}",region="{_escape_prometheus_label_value(region)}"}}',
+            'metric': f'{metric_name("viewers_by_region")}{{{stream_label_selector(stream)},country="{country}",region="{region}"}}',
             'value': float(len(ips)),
             'timestamp': timestamp_ms,
         })
@@ -1296,7 +1198,8 @@ def extract_track_from_path(path: str) -> str:
 
 def extract_resolution_track(event: Event) -> str:
     """Extract track/resolution label from raw request path."""
-    return extract_track_from_path(event.request_path)
+    path = event.raw_data.get('clientRequestPath', '') if event.raw_data else ''
+    return extract_track_from_path(path)
 
 
 def is_video_track(track: str) -> bool:
@@ -1510,7 +1413,7 @@ class LogParser:
         - locationID: Edge location
         """
         try:
-            data = _json_loads(line)
+            data = json.loads(line)
             
             # Extract required fields
             timestamp_str = data.get('timestamp')
@@ -1568,7 +1471,7 @@ class LogParser:
                 location_id=data.get('locationID', 'unknown'),
                 client_ip=data.get('clientIP', '0.0.0.0'),
                 device_type=detect_device_type(user_agent),
-                request_path=path,
+                raw_data=data
             )
             
             return event
@@ -1660,11 +1563,6 @@ class MetricAggregator:
     
     def __init__(self, metric_definitions: List[MetricDefinition]):
         self.metric_definitions = metric_definitions
-        # Pre-compute sorted label keys per metric to avoid re-sorting on every event
-        self._sorted_keys = {
-            md.name: sorted(list(md.labels.keys()) + ['minute'])
-            for md in metric_definitions
-        }
     
     def aggregate_events(self, events: List[Event]) -> Dict[str, Dict[Tuple[str, ...], any]]:
         """
@@ -1690,8 +1588,8 @@ class MetricAggregator:
                 # Add minute to labels
                 labels['minute'] = event.minute_key
                 
-                # Create label tuple for grouping (pre-computed key order)
-                label_tuple = tuple(labels[k] for k in self._sorted_keys[metric_def.name])
+                # Create label tuple for grouping (sorted for consistency)
+                label_tuple = tuple(labels[k] for k in sorted(labels.keys()))
                 
                 # Initialize collection based on aggregation type
                 if label_tuple not in aggregated[metric_def.name]:
@@ -1741,8 +1639,10 @@ class MetricAggregator:
                     logger.warning(f"Unknown aggregation type: {metric_def.aggregation}")
                     continue
                 
-                # Reconstruct labels dict from tuple (using pre-computed key order)
-                all_label_keys = self._sorted_keys[metric_def.name]
+                # Reconstruct labels dict from tuple
+                # The tuple was created with sorted(labels.keys()), so we need the same order
+                # labels.keys() at creation time = sorted(metric_def.labels.keys()) + ['minute']
+                all_label_keys = sorted(list(metric_def.labels.keys()) + ['minute'])
                 labels_dict = dict(zip(all_label_keys, label_tuple))
                 
                 results.append({
@@ -1796,7 +1696,7 @@ class PrometheusExporter:
             output_labels = add_legacy_stream_name_label(labels)
             for key, val in sorted(output_labels.items()):
                 if key != 'minute':
-                    label_strs.append(f'{key}="{_escape_prometheus_label_value(val)}"')
+                    label_strs.append(f'{key}="{val}"')
             label_string = ','.join(label_strs)
             
             metrics.append({
@@ -1836,7 +1736,7 @@ class PrometheusExporter:
             label_strs = []
             output_labels = add_legacy_stream_name_label(labels)
             for key, val in sorted(output_labels.items()):
-                label_strs.append(f'{key}="{_escape_prometheus_label_value(val)}"')
+                label_strs.append(f'{key}="{val}"')
             label_string = ','.join(label_strs)
             
             metrics.append({
@@ -1869,7 +1769,13 @@ class PrometheusExporter:
                 
                 # Parse metric name and labels
                 metric_str = metric_data['metric']
-                metric_name, label_pairs = _parse_metric_identifier(metric_str)
+                if '{' in metric_str and metric_str.endswith('}'):
+                    brace_idx = metric_str.index('{')
+                    metric_name = metric_str[:brace_idx]
+                    labels_str = metric_str[brace_idx+1:-1]
+                else:
+                    metric_name = metric_str
+                    labels_str = ""
                 
                 # Add __name__ label
                 label = ts.labels.add()
@@ -1877,10 +1783,16 @@ class PrometheusExporter:
                 label.value = metric_name
                 
                 # Add other labels
-                for key, value in label_pairs:
-                    label = ts.labels.add()
-                    label.name = key
-                    label.value = value
+                if labels_str:
+                    for label_pair in labels_str.split(','):
+                        if not label_pair:
+                            continue
+                        eq_idx = label_pair.index('=')
+                        key = label_pair[:eq_idx]
+                        value = label_pair[eq_idx+2:-1]
+                        label = ts.labels.add()
+                        label.name = key
+                        label.value = value
                 
                 # Add sample
                 sample = ts.samples.add()
@@ -2278,28 +2190,29 @@ class S3Importer:
                 emit_file_processing_metrics(False, lines_processed)
                 return False
             
-            # Stream-decompress gzip and parse events
-            events = []
-            invalid_lines = 0
-
+            # Decompress gzip
             try:
-                with gzip.open(io.BytesIO(compressed_data), 'rt', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.rstrip('\n')
-                        if not line.strip():
-                            continue
-
-                        lines_processed += 1
-                        event = self.parser.parse_json_to_event(line)
-
-                        if event:
-                            events.append(event)
-                        else:
-                            invalid_lines += 1
+                ndjson_content = gzip.decompress(compressed_data).decode('utf-8')
             except Exception as e:
                 logger.error(f"Failed to decompress {s3_key}: {e}")
                 emit_file_processing_metrics(False, lines_processed)
                 return False
+            
+            # Parse events from file
+            events = []
+            invalid_lines = 0
+            
+            for line in ndjson_content.splitlines():
+                if not line.strip():
+                    continue
+                
+                lines_processed += 1
+                event = self.parser.parse_json_to_event(line)
+                
+                if event:
+                    events.append(event)
+                else:
+                    invalid_lines += 1
             
             # Add all events to buffer (no immediate flush)
             if events:

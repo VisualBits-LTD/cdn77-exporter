@@ -1,0 +1,23 @@
+[package]
+name = "cdn-exporter"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cdn-exporter"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simd-json = "0.14"
+ahash = { version = "0.8", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+memchr = "2"
+percent-encoding = "2"
+regex = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
