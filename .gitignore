@@ -24,3 +24,6 @@ cdn-exporter-polars/target/
 
 # OS
 .DS_Store
+
+# Tmp
+state/session_state.json.gz
