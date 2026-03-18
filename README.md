@@ -18,7 +18,7 @@ Copilot context for this repository: [`.github/copilot-instructions.md`](.github
 Metric names are prefixed by `METRIC_PREFIX` (default: `cdn_`).
 Examples below use the `cdn_` prefix.
 
-The exporter generates 22 metrics with rich dimensional labels (stream, cdn_id, cache_status, pop, response_status, device_type, country, region, track):
+The exporter generates 23 metrics with rich dimensional labels (stream, cdn_id, cache_status, pop, response_status, device_type, country, region, track):
 
 ### Counters (use with `rate()` or `increase()`)
 
@@ -161,6 +161,12 @@ The exporter generates 22 metrics with rich dimensional labels (stream, cdn_id, 
 - Labels: `result` (`success` or `failure`)
 - Query average processing time: `avg_over_time(cdn_file_process_time_seconds{result="success"}[5m])`
 - Query failure processing time: `avg_over_time(cdn_file_process_time_seconds{result="failure"}[15m])`
+
+**`cdn_file_process_delay_seconds`**
+- Parse lag in seconds between wall-clock now and the newest parsed event timestamp in a processed file (gauge)
+- Labels: `result` (`success` when delay can be computed)
+- Query current ingest lag: `max_over_time(cdn_file_process_delay_seconds{result="success"}[5m])`
+- Query lag trend: `avg_over_time(cdn_file_process_delay_seconds{result="success"}[30m])`
 
 **`cdn_file_lines_processed_total`**
 - Number of NDJSON lines processed per file (gauge-like per-file sample)

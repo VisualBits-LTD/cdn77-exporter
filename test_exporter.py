@@ -6,6 +6,7 @@ Generates mock log data and validates metric processing
 
 import json
 import gzip
+import io
 import random
 import queue
 import os
@@ -24,8 +25,11 @@ from exporter import (
     MetricDefinition, METRIC_DEFINITIONS, detect_device_type,
     SessionTracker, SessionInfo,
     build_file_viewer_metrics,
+    minute_timestamp_ms,
+    metric_name,
     PrometheusExporter,
     PrometheusWriterThread,
+    S3Importer,
     extract_stream_id, extract_cdn_id, extract_cache_status,
     extract_location_id, extract_response_status, extract_client_ip, extract_device_type,
     extract_track_from_path, extract_resolution_track,
@@ -2241,6 +2245,119 @@ class TestPrometheusWriterRetries:
 
         assert ok is False
         assert exporter.calls == 3
+
+
+class TestPolarsViewerMetricLabels:
+    def test_polars_viewer_metrics_escape_labels_and_include_legacy_stream_name(self):
+        polars_mod = pytest.importorskip("exporter_polars")
+        dataframe_from_events = polars_mod.dataframe_from_events
+        build_file_viewer_metrics_polars = polars_mod.build_file_viewer_metrics_polars
+
+        stream_id = "abcd1234567890abcdef1234567890ab"
+        ts = datetime(2026, 3, 1, 12, 0, 0, tzinfo=timezone.utc)
+        events = [
+            Event(
+                timestamp=ts,
+                stream_id=stream_id,
+                client_ip="10.0.0.1",
+                device_type='web\\"tv',
+                resource_id=123,
+                cache_status="HIT",
+                response_bytes=1000,
+                time_to_first_byte_ms=100,
+                tcp_rtt_us=50000,
+                request_time_ms=150,
+                response_status=200,
+                client_country='U\\"S',
+                location_id="testPOP",
+                request_path=f"/{stream_id}/tracks-v3/rewind-43200.fmp4.m3u8",
+            ),
+        ]
+
+        df = dataframe_from_events(events)
+
+        metrics = build_file_viewer_metrics_polars(
+            df,
+            timestamp_ms=minute_timestamp_ms(ts),
+            geo_lookup=lambda _ip: ('U\\"S', 'North\\"East'),
+        )
+
+        metric_names = [m["metric"] for m in metrics]
+
+        assert any(
+            f'cdn77_viewers{{stream="{stream_id}",stream_name="{stream_id}"}}' == metric
+            for metric in metric_names
+        )
+        assert any('device_type="web\\\\\\"tv"' in metric for metric in metric_names)
+        assert any('country="U\\\\\\"S"' in metric for metric in metric_names)
+        assert any('region="North\\\\\\"East"' in metric for metric in metric_names)
+
+
+class TestFileProcessingTelemetry:
+    def test_process_file_emits_file_process_delay_seconds(self):
+        now = datetime.now(timezone.utc)
+        newest_event_ts = now - timedelta(seconds=42)
+
+        event = Event(
+            timestamp=newest_event_ts,
+            stream_id="78001c7e2b3ff8ca21b504883b47c44c",
+            resource_id=123,
+            cache_status="HIT",
+            response_bytes=1000,
+            time_to_first_byte_ms=100,
+            tcp_rtt_us=50000,
+            request_time_ms=150,
+            response_status=200,
+            client_country="US",
+            location_id="losangelesUSCA",
+            client_ip="192.168.1.1",
+            device_type="web",
+            request_path="/78001c7e2b3ff8ca21b504883b47c44c/tracks-v3/index.m3u8",
+        )
+
+        compressed_payload = io.BytesIO()
+        with gzip.open(compressed_payload, "wt", encoding="utf-8") as gz:
+            gz.write("{}\n")
+
+        class _FakeS3Client:
+            def download_object(self, key):
+                return compressed_payload.getvalue()
+
+            def delete_object(self, key):
+                return True
+
+        class _FakeParser:
+            def parse_json_to_event(self, line):
+                return event
+
+        class _FakeBuffer:
+            def add_many(self, events):
+                return None
+
+        importer = S3Importer.__new__(S3Importer)
+        importer.s3_client = _FakeS3Client()
+        importer.parser = _FakeParser()
+        importer.event_buffer = _FakeBuffer()
+        importer.write_queue = queue.Queue(maxsize=10)
+
+        ok = importer.process_file("real-time-logs/test.ndjson.gz")
+
+        assert ok is True
+        metrics, source = importer.write_queue.get_nowait()
+        assert source == "FileProcessMetrics"
+
+        delay_metric = [
+            m for m in metrics
+            if m["metric"].startswith(f'{metric_name("file_process_delay_seconds")}{{')
+        ]
+        assert len(delay_metric) == 1
+        assert 'result="success"' in delay_metric[0]["metric"]
+
+        delay_value = delay_metric[0]["value"]
+        assert delay_value >= 0.0
+        assert 30.0 <= delay_value <= 90.0
+
+        assert delay_metric[0]["timestamp"] == minute_timestamp_ms(newest_event_ts)
 
 
 class TestPrometheusExporterPush:

@@ -2248,7 +2248,12 @@ class S3Importer:
         started_at = time.monotonic()
         lines_processed = 0
 
-        def emit_file_processing_metrics(success: bool, processed_lines: int, reference_time: Optional[datetime] = None):
+        def emit_file_processing_metrics(
+            success: bool,
+            processed_lines: int,
+            reference_time: Optional[datetime] = None,
+            newest_file_timestamp: Optional[datetime] = None,
+        ):
             duration_seconds = time.monotonic() - started_at
             timestamp_ms = minute_timestamp_ms(reference_time or datetime.now(timezone.utc))
             result_label = "success" if success else "failure"
@@ -2264,6 +2269,19 @@ class S3Importer:
                     'timestamp': timestamp_ms,
                 },
             ]
+
+            # Parsing lag = wall clock now minus newest event timestamp in the file.
+            if newest_file_timestamp is not None:
+                file_process_delay_seconds = max(
+                    0.0,
+                    (datetime.now(timezone.utc) - newest_file_timestamp).total_seconds(),
+                )
+                metrics.append({
+                    'metric': f'{metric_name("file_process_delay_seconds")}{{result="{result_label}"}}',
+                    'value': file_process_delay_seconds,
+                    'timestamp': timestamp_ms,
+                })
+
             try:
                 self.write_queue.put((metrics, "FileProcessMetrics"), timeout=1.0)
             except queue.Full:
@@ -2306,9 +2324,11 @@ class S3Importer:
                 self.event_buffer.add_many(events)
                 
             # Log statistics
+            newest_event_time: Optional[datetime] = None
             if events:
                 min_ts = min(e.timestamp for e in events)
                 max_ts = max(e.timestamp for e in events)
+                newest_event_time = max_ts
                 time_range = f"{min_ts.strftime('%H:%M:%S')} to {max_ts.strftime('%H:%M:%S')} UTC"
             else:
                 time_range = "no valid events"
@@ -2322,8 +2342,13 @@ class S3Importer:
             # Delete from S3 after successful processing
             self.s3_client.delete_object(s3_key)
 
-            reference_time = max(e.timestamp for e in events) if events else datetime.now(timezone.utc)
-            emit_file_processing_metrics(True, lines_processed, reference_time=reference_time)
+            reference_time = newest_event_time or datetime.now(timezone.utc)
+            emit_file_processing_metrics(
+                True,
+                lines_processed,
+                reference_time=reference_time,
+                newest_file_timestamp=newest_event_time,
+            )
             
             return True
             
