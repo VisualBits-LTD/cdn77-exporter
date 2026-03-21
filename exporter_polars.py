@@ -25,6 +25,7 @@ except ImportError:
 
 from exporter import (
     SessionTracker,
+    _escape_prometheus_label_value,
     detect_device_type,
     extract_track_from_path,
     metric_name,
@@ -570,8 +571,9 @@ def build_file_viewer_metrics_polars(
     agg = df.group_by(['stream_id', 'device_type']).agg(pl.col('client_ip').n_unique())
     for row in agg.iter_rows(named=True):
         stream = row['stream_id']
+        device_type = _escape_prometheus_label_value(row['device_type'])
         metrics.append({
-            'metric': f'{metric_name("viewers_by_device")}{{{stream_label_selector(stream)},device_type="{row["device_type"]}"}}',
+            'metric': f'{metric_name("viewers_by_device")}{{{stream_label_selector(stream)},device_type="{device_type}"}}',
             'value': float(row['client_ip']),
             'timestamp': timestamp_ms,
         })
@@ -580,8 +582,9 @@ def build_file_viewer_metrics_polars(
     agg = df.group_by(['stream_id', 'client_country']).agg(pl.col('client_ip').n_unique())
     for row in agg.iter_rows(named=True):
         stream = row['stream_id']
+        country = _escape_prometheus_label_value(row['client_country'])
         metrics.append({
-            'metric': f'{metric_name("viewers_by_country")}{{{stream_label_selector(stream)},country="{row["client_country"]}"}}',
+            'metric': f'{metric_name("viewers_by_country")}{{{stream_label_selector(stream)},country="{country}"}}',
             'value': float(row['client_ip']),
             'timestamp': timestamp_ms,
         })
@@ -592,8 +595,9 @@ def build_file_viewer_metrics_polars(
         agg = video_df.group_by(['stream_id', 'track']).agg(pl.col('client_ip').n_unique())
         for row in agg.iter_rows(named=True):
             stream = row['stream_id']
+            track = _escape_prometheus_label_value(row['track'])
             metrics.append({
-                'metric': f'{metric_name("viewers_by_resolution")}{{{stream_label_selector(stream)},track="{row["track"]}"}}',
+                'metric': f'{metric_name("viewers_by_resolution")}{{{stream_label_selector(stream)},track="{track}"}}',
                 'value': float(row['client_ip']),
                 'timestamp': timestamp_ms,
             })
@@ -630,12 +634,14 @@ def build_file_viewer_metrics_polars(
             ).agg(pl.col('client_ip').n_unique())
             for row in agg.iter_rows(named=True):
                 stream = row['stream_id']
+                country = _escape_prometheus_label_value(row['geo_country'])
+                region = _escape_prometheus_label_value(row['geo_region'])
                 metrics.append({
                     'metric': (
                         f'{metric_name("viewers_by_region")}'
                         f'{{{stream_label_selector(stream)},'
-                        f'country="{row["geo_country"]}",'
-                        f'region="{row["geo_region"]}"}}'
+                        f'country="{country}",'
+                        f'region="{region}"}}'
                     ),
                     'value': float(row['client_ip']),
                     'timestamp': timestamp_ms,

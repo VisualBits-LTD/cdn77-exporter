@@ -12,6 +12,7 @@ Architecture:
 
 import argparse
 import gzip
+import ipaddress
 import json
 import logging
 import os
@@ -92,11 +93,21 @@ def _watch_band_label(duration_seconds: float) -> str:
         return "0_1m"
     if duration_seconds <= 300:
         return "1_5m"
+    if duration_seconds <= 600:
+        return "5_10m"
     if duration_seconds <= 1200:
-        return "5_20m"
+        return "10_20m"
     if duration_seconds <= 3600:
         return "20_60m"
-    return "60m_plus"
+    return "60_plus"
+
+
+def _ip_version_label(ip_address_text: str) -> str:
+    """Classify textual IP address as ipv4/ipv6, falling back to unknown."""
+    try:
+        return "ipv4" if ipaddress.ip_address(ip_address_text).version == 4 else "ipv6"
+    except ValueError:
+        return "unknown"
 
 
 def floor_to_minute(dt: datetime) -> datetime:
@@ -382,7 +393,12 @@ class SessionTracker:
         self._geo_warning_limit = 25
         self._geo_reader_missing_logged = False
         self._watch_sessions_total: Dict[str, int] = defaultdict(int)
+        self._watch_sessions_by_device_total: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
         self._watch_time_seconds_total: Dict[str, float] = defaultdict(float)
+        self._watch_time_seconds_by_device_total: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        self._watch_time_seconds_by_device_band_total: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
+            lambda: defaultdict(lambda: defaultdict(float))
+        )
         self._watch_duration_sum: Dict[str, float] = defaultdict(float)
         self._watch_duration_count: Dict[str, int] = defaultdict(int)
         self._watch_duration_bucket_counts: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
@@ -418,9 +434,13 @@ class SessionTracker:
         """Aggregate watch-time metrics for a closed session."""
         duration_seconds = max(0.0, (session.last_seen - session.first_seen).total_seconds())
         duration_band = _watch_band_label(duration_seconds)
+        device_type = session.device_type or 'other'
 
         self._watch_sessions_total[stream_id] += 1
+        self._watch_sessions_by_device_total[stream_id][device_type] += 1
         self._watch_time_seconds_total[stream_id] += duration_seconds
+        self._watch_time_seconds_by_device_total[stream_id][device_type] += duration_seconds
+        self._watch_time_seconds_by_device_band_total[stream_id][device_type][duration_band] += duration_seconds
         self._watch_duration_sum[stream_id] += duration_seconds
         self._watch_duration_count[stream_id] += 1
         self._watch_duration_band_counts[stream_id][duration_band] += 1
@@ -583,6 +603,7 @@ class SessionTracker:
         Returns metrics representing unique viewers in the rolling window:
         - cdn77_viewers: Total unique IPs per stream
         - cdn77_viewers_by_device: Unique IPs per stream per device
+        - cdn77_viewers_by_ip_version: Unique IPs per stream per IP version
         - cdn77_viewers_by_country: Unique IPs per stream per country
         - cdn77_viewers_by_region: Unique IPs per stream per region
         
@@ -612,11 +633,13 @@ class SessionTracker:
                 
                 # Group by device type
                 by_device = defaultdict(set)
+                by_ip_version = defaultdict(set)
                 by_country = defaultdict(set)
                 by_region = defaultdict(set)
                 
                 for ip, session in sessions.items():
                     by_device[session.device_type].add(ip)
+                    by_ip_version[_ip_version_label(ip)].add(ip)
                     by_country[session.country].add(ip)
                     by_region[f"{session.country}_{session.region}"].add(ip)
                 
@@ -629,6 +652,18 @@ class SessionTracker:
                         'labels': {
                             'stream': stream_id,
                             'device_type': device_type,
+                        }
+                    })
+
+                # IP version metrics
+                for ip_version, ips in by_ip_version.items():
+                    metrics.append({
+                        'metric_name': metric_name('viewers_by_ip_version'),
+                        'value': float(len(ips)),
+                        'timestamp_ms': timestamp_ms,
+                        'labels': {
+                            'stream': stream_id,
+                            'ip_version': ip_version,
                         }
                     })
                 
@@ -682,18 +717,46 @@ class SessionTracker:
             metrics: List[Dict] = []
 
             for stream_id, sessions_total in self._watch_sessions_total.items():
-                metrics.append({
-                    'metric_name': metric_name('watch_sessions_total'),
-                    'value': float(sessions_total),
-                    'timestamp_ms': timestamp_ms,
-                    'labels': {'stream': stream_id},
-                })
+                for device_type in sorted(self._watch_sessions_by_device_total.get(stream_id, {}).keys()):
+                    metrics.append({
+                        'metric_name': metric_name('watch_sessions_total'),
+                        'value': float(self._watch_sessions_by_device_total[stream_id].get(device_type, 0)),
+                        'timestamp_ms': timestamp_ms,
+                        'labels': {
+                            'stream': stream_id,
+                            'device_type': device_type,
+                        },
+                    })
                 metrics.append({
                     'metric_name': metric_name('watch_time_seconds_total'),
                     'value': float(self._watch_time_seconds_total.get(stream_id, 0.0)),
                     'timestamp_ms': timestamp_ms,
                     'labels': {'stream': stream_id},
                 })
+                for device_type in sorted(self._watch_time_seconds_by_device_total.get(stream_id, {}).keys()):
+                    metrics.append({
+                        'metric_name': metric_name('watch_time_seconds_by_device_total'),
+                        'value': float(self._watch_time_seconds_by_device_total[stream_id].get(device_type, 0.0)),
+                        'timestamp_ms': timestamp_ms,
+                        'labels': {
+                            'stream': stream_id,
+                            'device_type': device_type,
+                        },
+                    })
+                for device_type in sorted(self._watch_time_seconds_by_device_band_total.get(stream_id, {}).keys()):
+                    for band in ('0_1m', '1_5m', '5_10m', '10_20m', '20_60m', '60_plus'):
+                        metrics.append({
+                            'metric_name': metric_name('watch_time_seconds_by_device_band_total'),
+                            'value': float(
+                                self._watch_time_seconds_by_device_band_total[stream_id][device_type].get(band, 0.0)
+                            ),
+                            'timestamp_ms': timestamp_ms,
+                            'labels': {
+                                'stream': stream_id,
+                                'device_type': device_type,
+                                'band': band,
+                            },
+                        })
                 metrics.append({
                     'metric_name': metric_name('watch_session_duration_seconds_sum'),
                     'value': float(self._watch_duration_sum.get(stream_id, 0.0)),
@@ -707,7 +770,7 @@ class SessionTracker:
                     'labels': {'stream': stream_id},
                 })
 
-                for band in ('0_1m', '1_5m', '5_20m', '20_60m', '60m_plus'):
+                for band in ('0_1m', '1_5m', '5_10m', '10_20m', '20_60m', '60_plus'):
                     metrics.append({
                         'metric_name': metric_name('watch_session_duration_band_total'),
                         'value': float(self._watch_duration_band_counts[stream_id].get(band, 0)),
@@ -770,11 +833,13 @@ class SessionTracker:
                 })
 
                 by_device = defaultdict(set)
+                by_ip_version = defaultdict(set)
                 by_country = defaultdict(set)
                 by_region = defaultdict(set)
 
                 for ip, session in active_sessions.items():
                     by_device[session.device_type].add(ip)
+                    by_ip_version[_ip_version_label(ip)].add(ip)
                     by_country[session.country].add(ip)
                     by_region[f"{session.country}_{session.region}"].add(ip)
 
@@ -786,6 +851,18 @@ class SessionTracker:
                         'labels': {
                             'stream': stream_id,
                             'device_type': device_type,
+                            'window': window_label,
+                        }
+                    })
+
+                for ip_version, ips in by_ip_version.items():
+                    metrics.append({
+                        'metric_name': metric_name('viewers_unique_by_ip_version'),
+                        'value': float(len(ips)),
+                        'timestamp_ms': timestamp_ms,
+                        'labels': {
+                            'stream': stream_id,
+                            'ip_version': ip_version,
                             'window': window_label,
                         }
                     })
@@ -869,7 +946,22 @@ class SessionTracker:
             with self._lock:
                 watch_payload = {
                     'sessions_total': dict(self._watch_sessions_total),
+                    'sessions_by_device_total': {
+                        stream_id: dict(device_totals)
+                        for stream_id, device_totals in self._watch_sessions_by_device_total.items()
+                    },
                     'time_seconds_total': dict(self._watch_time_seconds_total),
+                    'time_seconds_by_device_total': {
+                        stream_id: dict(device_totals)
+                        for stream_id, device_totals in self._watch_time_seconds_by_device_total.items()
+                    },
+                    'time_seconds_by_device_band_total': {
+                        stream_id: {
+                            device_type: dict(band_totals)
+                            for device_type, band_totals in device_totals.items()
+                        }
+                        for stream_id, device_totals in self._watch_time_seconds_by_device_band_total.items()
+                    },
                     'duration_sum': dict(self._watch_duration_sum),
                     'duration_count': dict(self._watch_duration_count),
                     'duration_band_counts': {
@@ -942,9 +1034,24 @@ class SessionTracker:
             restored_watch_sessions_total = defaultdict(int, {
                 str(k): int(v) for k, v in watch_payload.get('sessions_total', {}).items()
             })
+            restored_watch_sessions_by_device_total: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+            for stream_id, device_totals in watch_payload.get('sessions_by_device_total', {}).items():
+                for device_type, total in device_totals.items():
+                    restored_watch_sessions_by_device_total[str(stream_id)][str(device_type)] = int(total)
             restored_watch_time_total = defaultdict(float, {
                 str(k): float(v) for k, v in watch_payload.get('time_seconds_total', {}).items()
             })
+            restored_watch_time_by_device_total: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+            for stream_id, device_totals in watch_payload.get('time_seconds_by_device_total', {}).items():
+                for device_type, total in device_totals.items():
+                    restored_watch_time_by_device_total[str(stream_id)][str(device_type)] = float(total)
+            restored_watch_time_by_device_band_total: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
+                lambda: defaultdict(lambda: defaultdict(float))
+            )
+            for stream_id, device_totals in watch_payload.get('time_seconds_by_device_band_total', {}).items():
+                for device_type, band_totals in device_totals.items():
+                    for band, total in band_totals.items():
+                        restored_watch_time_by_device_band_total[str(stream_id)][str(device_type)][str(band)] = float(total)
             restored_watch_duration_sum = defaultdict(float, {
                 str(k): float(v) for k, v in watch_payload.get('duration_sum', {}).items()
             })
@@ -963,7 +1070,10 @@ class SessionTracker:
             with self._lock:
                 self.sessions = restored
                 self._watch_sessions_total = restored_watch_sessions_total
+                self._watch_sessions_by_device_total = restored_watch_sessions_by_device_total
                 self._watch_time_seconds_total = restored_watch_time_total
+                self._watch_time_seconds_by_device_total = restored_watch_time_by_device_total
+                self._watch_time_seconds_by_device_band_total = restored_watch_time_by_device_band_total
                 self._watch_duration_sum = restored_watch_duration_sum
                 self._watch_duration_count = restored_watch_duration_count
                 self._watch_duration_band_counts = restored_watch_bands
@@ -989,6 +1099,7 @@ def build_file_viewer_metrics(
 
     by_stream_ips: Dict[str, Set[str]] = defaultdict(set)
     by_stream_device: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+    by_stream_ip_version: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
     by_stream_country: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
     by_stream_track: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
     by_stream_region: Dict[Tuple[str, str, str], Set[str]] = defaultdict(set)
@@ -999,6 +1110,7 @@ def build_file_viewer_metrics(
 
         by_stream_ips[stream].add(ip)
         by_stream_device[(stream, event.device_type)].add(ip)
+        by_stream_ip_version[(stream, _ip_version_label(ip))].add(ip)
         track = extract_resolution_track(event)
         if is_video_track(track):
             by_stream_track[(stream, track)].add(ip)
@@ -1024,6 +1136,13 @@ def build_file_viewer_metrics(
     for (stream, device_type), ips in by_stream_device.items():
         metrics.append({
             'metric': f'{metric_name("viewers_by_device")}{{{stream_label_selector(stream)},device_type="{device_type}"}}',
+            'value': float(len(ips)),
+            'timestamp': timestamp_ms,
+        })
+
+    for (stream, ip_version), ips in by_stream_ip_version.items():
+        metrics.append({
+            'metric': f'{metric_name("viewers_by_ip_version")}{{{stream_label_selector(stream)},ip_version="{ip_version}"}}',
             'value': float(len(ips)),
             'timestamp': timestamp_ms,
         })

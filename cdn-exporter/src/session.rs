@@ -19,12 +19,14 @@ fn watch_band_label(duration_seconds: f64) -> &'static str {
         "0-1m"
     } else if duration_seconds < 300.0 {
         "1-5m"
+    } else if duration_seconds < 600.0 {
+        "5-10m"
     } else if duration_seconds < 1200.0 {
-        "5-20m"
+        "10-20m"
     } else if duration_seconds < 3600.0 {
         "20-60m"
     } else {
-        "60m+"
+        "60+"
     }
 }
 
