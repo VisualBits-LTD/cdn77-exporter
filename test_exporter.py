@@ -980,7 +980,7 @@ class TestSessionTracker:
             Event(
                 timestamp=base_time,
                 stream_id=stream_id,
-                client_ip="10.0.0.2",
+                client_ip="2001:db8::2",
                 device_type="apple_tv",
                 resource_id=123, cache_status="HIT", response_bytes=1000,
                 time_to_first_byte_ms=100, tcp_rtt_us=50000, request_time_ms=150,
@@ -1004,6 +1004,7 @@ class TestSessionTracker:
         metric_names = {m['metric_name'] for m in metrics}
         assert 'cdn77_viewers' in metric_names
         assert 'cdn77_viewers_by_device' in metric_names
+        assert 'cdn77_viewers_by_ip_version' in metric_names
         assert 'cdn77_viewers_by_country' in metric_names
         
         # Check total viewers
@@ -1016,6 +1017,12 @@ class TestSessionTracker:
         apple_tv_count = [m for m in device_metrics if m['labels']['device_type'] == 'apple_tv'][0]['value']
         assert roku_count == 2.0
         assert apple_tv_count == 1.0
+
+        ip_version_metrics = [m for m in metrics if m['metric_name'] == 'cdn77_viewers_by_ip_version']
+        ipv4_count = [m for m in ip_version_metrics if m['labels']['ip_version'] == 'ipv4'][0]['value']
+        ipv6_count = [m for m in ip_version_metrics if m['labels']['ip_version'] == 'ipv6'][0]['value']
+        assert ipv4_count == 2.0
+        assert ipv6_count == 1.0
     
     def test_retroactive_updates(self):
         """Test handling of retroactive data (delayed files)"""
@@ -1105,15 +1112,30 @@ class TestSessionTracker:
         tracker.expire_old(start + timedelta(hours=2))
         metrics = tracker.get_watch_time_metrics(reference_time=start + timedelta(hours=2))
 
-        sessions_metric = [m for m in metrics if m['metric_name'] == 'cdn77_watch_sessions_total'][0]
+        sessions_metric = [
+            m for m in metrics
+            if m['metric_name'] == 'cdn77_watch_sessions_total'
+            and m['labels']['device_type'] == 'web'
+        ][0]
         watch_time_metric = [m for m in metrics if m['metric_name'] == 'cdn77_watch_time_seconds_total'][0]
+        watch_time_by_device_metric = [
+            m for m in metrics
+            if m['metric_name'] == 'cdn77_watch_time_seconds_by_device_total'
+            and m['labels']['device_type'] == 'web'
+        ][0]
+        watch_time_by_device_band_metric = [
+            m for m in metrics
+            if m['metric_name'] == 'cdn77_watch_time_seconds_by_device_band_total'
+            and m['labels']['device_type'] == 'web'
+            and m['labels']['band'] == '10_20m'
+        ][0]
         p1200_bucket = [
             m for m in metrics
             if m['metric_name'] == 'cdn77_watch_session_duration_seconds_bucket' and m['labels']['le'] == '1200'
         ][0]
-        band_5_20m = [
+        band_10_20m = [
             m for m in metrics
-            if m['metric_name'] == 'cdn77_watch_session_duration_band_total' and m['labels']['band'] == '5_20m'
+            if m['metric_name'] == 'cdn77_watch_session_duration_band_total' and m['labels']['band'] == '10_20m'
         ][0]
         inf_bucket = [
             m for m in metrics
@@ -1122,8 +1144,10 @@ class TestSessionTracker:
 
         assert sessions_metric['value'] == 1.0
         assert watch_time_metric['value'] == 1200.0
+        assert watch_time_by_device_metric['value'] == 1200.0
+        assert watch_time_by_device_band_metric['value'] == 1200.0
         assert p1200_bucket['value'] == 1.0
-        assert band_5_20m['value'] == 1.0
+        assert band_10_20m['value'] == 1.0
         assert inf_bucket['value'] == 1.0
 
     def test_watch_time_metrics_split_on_session_gap(self):
@@ -1166,8 +1190,23 @@ class TestSessionTracker:
         ])
 
         metrics = tracker.get_watch_time_metrics(reference_time=t2)
-        sessions_metric = [m for m in metrics if m['metric_name'] == 'cdn77_watch_sessions_total'][0]
+        sessions_metric = [
+            m for m in metrics
+            if m['metric_name'] == 'cdn77_watch_sessions_total'
+            and m['labels']['device_type'] == 'web'
+        ][0]
         watch_time_metric = [m for m in metrics if m['metric_name'] == 'cdn77_watch_time_seconds_total'][0]
+        watch_time_by_device_metric = [
+            m for m in metrics
+            if m['metric_name'] == 'cdn77_watch_time_seconds_by_device_total'
+            and m['labels']['device_type'] == 'web'
+        ][0]
+        watch_time_by_device_band_metric = [
+            m for m in metrics
+            if m['metric_name'] == 'cdn77_watch_time_seconds_by_device_band_total'
+            and m['labels']['device_type'] == 'web'
+            and m['labels']['band'] == '0_1m'
+        ][0]
         band_0_1m = [
             m for m in metrics
             if m['metric_name'] == 'cdn77_watch_session_duration_band_total' and m['labels']['band'] == '0_1m'
@@ -1175,6 +1214,8 @@ class TestSessionTracker:
 
         assert sessions_metric['value'] == 1.0
         assert watch_time_metric['value'] == 30.0
+        assert watch_time_by_device_metric['value'] == 30.0
+        assert watch_time_by_device_band_metric['value'] == 30.0
         assert band_0_1m['value'] == 1.0
 
     def test_watch_time_metrics_close_idle_sessions_without_window_expiry(self):
@@ -1211,8 +1252,23 @@ class TestSessionTracker:
         tracker.expire_old(reference_time)
         metrics = tracker.get_watch_time_metrics(reference_time=reference_time)
 
-        sessions_metric = [m for m in metrics if m['metric_name'] == 'cdn77_watch_sessions_total'][0]
+        sessions_metric = [
+            m for m in metrics
+            if m['metric_name'] == 'cdn77_watch_sessions_total'
+            and m['labels']['device_type'] == 'web'
+        ][0]
         watch_time_metric = [m for m in metrics if m['metric_name'] == 'cdn77_watch_time_seconds_total'][0]
+        watch_time_by_device_metric = [
+            m for m in metrics
+            if m['metric_name'] == 'cdn77_watch_time_seconds_by_device_total'
+            and m['labels']['device_type'] == 'web'
+        ][0]
+        watch_time_by_device_band_metric = [
+            m for m in metrics
+            if m['metric_name'] == 'cdn77_watch_time_seconds_by_device_band_total'
+            and m['labels']['device_type'] == 'web'
+            and m['labels']['band'] == '0_1m'
+        ][0]
         band_0_1m = [
             m for m in metrics
             if m['metric_name'] == 'cdn77_watch_session_duration_band_total' and m['labels']['band'] == '0_1m'
@@ -1220,6 +1276,8 @@ class TestSessionTracker:
 
         assert sessions_metric['value'] == 1.0
         assert watch_time_metric['value'] == 45.0
+        assert watch_time_by_device_metric['value'] == 45.0
+        assert watch_time_by_device_band_metric['value'] == 45.0
         assert band_0_1m['value'] == 1.0
 
     def test_region_metrics_use_geoip_when_region_missing(self):
@@ -1458,13 +1516,30 @@ class TestSessionTracker:
             restored.restore_from_file(snapshot_path, reference_time=base_time + timedelta(minutes=10))
             metrics = restored.get_watch_time_metrics(reference_time=base_time + timedelta(minutes=10))
 
-            sessions_metric = [m for m in metrics if m['metric_name'] == 'cdn77_watch_sessions_total'][0]
+            sessions_metric = [
+                m for m in metrics
+                if m['metric_name'] == 'cdn77_watch_sessions_total'
+                and m['labels']['device_type'] == 'web'
+            ][0]
+            watch_time_by_device_metric = [
+                m for m in metrics
+                if m['metric_name'] == 'cdn77_watch_time_seconds_by_device_total'
+                and m['labels']['device_type'] == 'web'
+            ][0]
+            watch_time_by_device_band_metric = [
+                m for m in metrics
+                if m['metric_name'] == 'cdn77_watch_time_seconds_by_device_band_total'
+                and m['labels']['device_type'] == 'web'
+                and m['labels']['band'] == '1_5m'
+            ][0]
             band_metric = [
                 m for m in metrics
                 if m['metric_name'] == 'cdn77_watch_session_duration_band_total' and m['labels']['band'] == '1_5m'
             ][0]
 
             assert sessions_metric['value'] == 1.0
+            assert watch_time_by_device_metric['value'] == 90.0
+            assert watch_time_by_device_band_metric['value'] == 90.0
             assert band_metric['value'] == 1.0
 
     def test_region_metric_has_expected_labels(self):
@@ -1648,6 +1723,7 @@ class TestSessionTracker:
         metric_names = {m['metric_name'] for m in metrics}
         assert 'cdn77_viewers_unique' in metric_names
         assert 'cdn77_viewers_unique_by_device' in metric_names
+        assert 'cdn77_viewers_unique_by_ip_version' in metric_names
         assert 'cdn77_viewers_unique_by_country' in metric_names
         assert 'cdn77_viewers_unique_by_region' in metric_names
 
@@ -1744,6 +1820,7 @@ class TestFileViewerMetrics:
         assert metric_map[f'cdn77_viewers{{stream="{stream_id}",stream_name="{stream_id}"}}'] == 3.0
         assert metric_map[f'cdn77_viewers_by_device{{stream="{stream_id}",stream_name="{stream_id}",device_type="roku"}}'] == 1.0
         assert metric_map[f'cdn77_viewers_by_device{{stream="{stream_id}",stream_name="{stream_id}",device_type="web"}}'] == 2.0
+        assert metric_map[f'cdn77_viewers_by_ip_version{{stream="{stream_id}",stream_name="{stream_id}",ip_version="ipv4"}}'] == 3.0
         assert metric_map[f'cdn77_viewers_by_country{{stream="{stream_id}",stream_name="{stream_id}",country="US"}}'] == 3.0
         assert metric_map[f'cdn77_viewers_by_resolution{{stream="{stream_id}",stream_name="{stream_id}",track="v3"}}'] == 2.0
         assert metric_map[f'cdn77_viewers_by_region{{stream="{stream_id}",stream_name="{stream_id}",country="US",region="California"}}'] == 1.0
@@ -1919,6 +1996,7 @@ class TestSessionTrackerSimulation:
         metric_types = {m['metric_name'] for m in final_metrics}
         assert 'cdn77_viewers' in metric_types
         assert 'cdn77_viewers_by_device' in metric_types
+        assert 'cdn77_viewers_by_ip_version' in metric_types
         assert 'cdn77_viewers_by_country' in metric_types
     
     def test_retroactive_data_accumulation(self):

@@ -18,7 +18,7 @@ Copilot context for this repository: [`.github/copilot-instructions.md`](.github
 Metric names are prefixed by `METRIC_PREFIX` (default: `cdn_`).
 Examples below use the `cdn_` prefix.
 
-The exporter generates 23 metrics with rich dimensional labels (stream, cdn_id, cache_status, pop, response_status, device_type, country, region, track):
+The exporter generates 27 metrics with rich dimensional labels (stream, cdn_id, cache_status, pop, response_status, device_type, country, region, track, ip_version):
 
 ### Counters (use with `rate()` or `increase()`)
 
@@ -87,6 +87,11 @@ The exporter generates 23 metrics with rich dimensional labels (stream, cdn_id, 
 - Query by platform: `cdn_viewers_by_device{stream="...", device_type="roku"}`
 - Baron vs OTT: `sum by (device_type) (cdn_viewers_by_device{stream="..."})`
 
+**`cdn_viewers_by_ip_version`**
+- Unique viewers by IP version from the latest processed file/flush (gauge)
+- Labels: `stream`, `ip_version` (`ipv4`, `ipv6`)
+- Query split: `sum by (ip_version) (cdn_viewers_by_ip_version{stream="..."})`
+
 **`cdn_viewers_by_country`**
 - Unique viewers by country from the latest processed file/flush (gauge)
 - Labels: `stream`, `country`
@@ -117,6 +122,11 @@ The exporter generates 23 metrics with rich dimensional labels (stream, cdn_id, 
 - Labels: `stream`, `device_type`, `window`
 - Query platform mix: `sum by (device_type) (cdn_viewers_unique_by_device{stream="...", window="1h"})`
 
+**`cdn_viewers_unique_by_ip_version`**
+- Rolling unique viewers by IP version for configured window (default: 1h) (gauge)
+- Labels: `stream`, `ip_version`, `window`
+- Query split: `sum by (ip_version) (cdn_viewers_unique_by_ip_version{stream="...", window="1h"})`
+
 **`cdn_viewers_unique_by_country`**
 - Rolling unique viewers by country for configured window (default: 1h) (gauge)
 - Labels: `stream`, `country`, `window`
@@ -130,14 +140,25 @@ The exporter generates 23 metrics with rich dimensional labels (stream, cdn_id, 
 
 **`cdn_watch_sessions_total`**
 - Total completed watch sessions by stream (counter)
-- Labels: `stream`
+- Labels: `stream`, `device_type`
 - Sessions close after `SESSION_GAP_SECONDS` of inactivity (or on hard expiry)
-- Query completed sessions: `increase(cdn_watch_sessions_total{stream="..."}[1h])`
+- Query completed sessions (all devices): `sum by (stream) (increase(cdn_watch_sessions_total{stream="..."}[1h]))`
+- Query completed sessions by device: `sum by (stream, device_type) (increase(cdn_watch_sessions_total{stream="..."}[1h]))`
 
 **`cdn_watch_time_seconds_total`**
 - Total watch time accumulated from completed sessions (counter)
 - Labels: `stream`
 - Query watch hours: `increase(cdn_watch_time_seconds_total{stream="..."}[1h]) / 3600`
+
+**`cdn_watch_time_seconds_by_device_total`**
+- Total watch time accumulated from completed sessions, segmented by device (counter)
+- Labels: `stream`, `device_type`
+- Query watch hours by device: `sum by (stream, device_type) (increase(cdn_watch_time_seconds_by_device_total[1h])) / 3600`
+
+**`cdn_watch_time_seconds_by_device_band_total`**
+- Total watch time accumulated from completed sessions by device and watch-time band (counter)
+- Labels: `stream`, `device_type`, `band` (`0_1m`, `1_5m`, `5_10m`, `10_20m`, `20_60m`, `60_plus`)
+- Query watch hours by device and band: `sum by (stream, device_type, band) (increase(cdn_watch_time_seconds_by_device_band_total[1h])) / 3600`
 
 **`cdn_watch_session_duration_seconds_bucket`** (+`_sum`, +`_count`)
 - Histogram of completed session durations by stream
@@ -146,7 +167,7 @@ The exporter generates 23 metrics with rich dimensional labels (stream, cdn_id, 
 
 **`cdn_watch_session_duration_band_total`**
 - Product-friendly session duration band totals by stream (counter)
-- Labels: `stream`, `band` (`0_1m`, `1_5m`, `5_20m`, `20_60m`, `60m_plus`)
+- Labels: `stream`, `band` (`0_1m`, `1_5m`, `5_10m`, `10_20m`, `20_60m`, `60_plus`)
 - Query engagement mix: `sum by (stream, band) (increase(cdn_watch_session_duration_band_total[1h]))`
 - Query short-session ratio: `sum(increase(cdn_watch_session_duration_band_total{band="0_1m"}[1h])) / sum(increase(cdn_watch_sessions_total[1h]))`
 
